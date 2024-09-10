@@ -3,9 +3,9 @@ name: Test Bats Unix Remote
 on:
   pull_request:
     branches: [ main ]
-    paths:
-      - 'go/**'
-      - 'integration-tests/**'
+#    paths:
+#      - 'go/**'
+#      - 'integration-tests/**'
 
 concurrency:
   group: ci-bats-unix-remote${{ github.event.pull_request.number || github.ref }}
