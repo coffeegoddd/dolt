@@ -2,7 +2,7 @@ name: Test PR 2
 
 on:
   pull_request:
-    branches: [ main ]
+    branches: [ "db/test-wf2" ]
 
 jobs:
   test:
