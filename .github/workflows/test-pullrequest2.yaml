@@ -16,5 +16,5 @@ jobs:
       matrix:
         os: [ ubuntu-22.04 ]
     steps:
-      - name: Run Hello World from BRANCH 2
+      - name: Run Hello World from BRANCH 3
         run: echo "hello world"
