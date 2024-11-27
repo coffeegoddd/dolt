@@ -2,7 +2,6 @@ name: Test Push
 
 on:
   push:
-    branches: [ alt ]
 
 jobs:
   test:
@@ -18,5 +17,5 @@ jobs:
     env:
       use_credentials: ${{ secrets.AWS_SECRET_ACCESS_KEY != '' && secrets.AWS_ACCESS_KEY_ID != '' }}
     steps:
-      - name: Run Hello World
+      - name: Run Hello World Whenever
         run: echo "hello world"
