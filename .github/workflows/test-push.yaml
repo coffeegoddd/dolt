@@ -1,9 +1,11 @@
-name: Test Push
+name: Test Push and Pull Request
 
 on:
   push:
     branches: [ main ]
-
+  pull_request:
+    branches:
+      - main
 jobs:
   test:
     name: Test GitHub Actions
