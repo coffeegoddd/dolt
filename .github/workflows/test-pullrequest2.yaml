@@ -1,8 +1,8 @@
-name: Test PR
+name: Test PR 2
 
 on:
   pull_request:
-    branches: [ main ]
+    branches: [ "db/test-wf2" ]
 
 jobs:
   test:
@@ -16,5 +16,5 @@ jobs:
       matrix:
         os: [ ubuntu-22.04 ]
     steps:
-      - name: Run Hello World
+      - name: Run Hello World from BRANCH 2
         run: echo "hello world"
