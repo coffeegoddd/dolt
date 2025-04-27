@@ -3,9 +3,9 @@ name: Test Bats Unix
 on:
   pull_request:
     branches: [ main ]
-    paths:
-      - 'go/**'
-      - 'integration-tests/**'
+#    paths:
+#      - 'go/**'
+#      - 'integration-tests/**'
 
 concurrency:
   group: ci-bats-unix-${{ github.event.pull_request.number || github.ref }}
