@@ -53,4 +53,4 @@
 # - github.org
 # - github.repo
 
-sync.remote: "git+https://github.com/coffeegoddd/dolt.git"
+sync.remote: "coffeegoddd/my_example_beads_db"
