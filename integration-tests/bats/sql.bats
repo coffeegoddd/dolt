@@ -2944,3 +2944,67 @@ SQL
     dolt sql < $BATS_TEST_DIRNAME/helper/with_utf16be_bom.sql
     dolt table rm t1
 }
+
+@test "sql: EXECUTE of a prepared UPDATE applies the write" {
+    run dolt sql -q "PREPARE s FROM 'UPDATE one_pk SET c1=99 WHERE pk=0'; EXECUTE s; DEALLOCATE PREPARE s;"
+    [ "$status" -eq 0 ]
+
+    run dolt sql -q "SELECT c1 FROM one_pk WHERE pk=0" -r csv
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "99" ]] || false
+}
+
+@test "sql: EXECUTE of a prepared INSERT applies the write" {
+    run dolt sql -q "PREPARE s FROM 'INSERT INTO one_pk (pk,c1,c2,c3,c4,c5) VALUES (4,40,40,40,40,40)'; EXECUTE s;"
+    [ "$status" -eq 0 ]
+
+    run dolt sql -q "SELECT c1 FROM one_pk WHERE pk=4" -r csv
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "40" ]] || false
+}
+
+@test "sql: EXECUTE of a prepared DELETE applies the write" {
+    run dolt sql -q "PREPARE s FROM 'DELETE FROM one_pk WHERE pk=3'; EXECUTE s;"
+    [ "$status" -eq 0 ]
+
+    run dolt sql -q "SELECT count(*) FROM one_pk WHERE pk=3" -r csv
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "0" ]] || false
+}
+
+@test "sql: EXECUTE of a prepared UPDATE with bound parameters applies the write" {
+    run dolt sql -q "SET @v=77; PREPARE s FROM 'UPDATE one_pk SET c1=? WHERE pk=1'; EXECUTE s USING @v;"
+    [ "$status" -eq 0 ]
+
+    run dolt sql -q "SELECT c1 FROM one_pk WHERE pk=1" -r csv
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "77" ]] || false
+}
+
+@test "sql: -f runs the SET/PREPARE/EXECUTE conditional migration idiom" {
+    cat > migration.sql <<SQL
+SET @sql = IF(1=1, 'UPDATE one_pk SET c1=55 WHERE pk=2', 'SELECT 1');
+PREPARE s FROM @sql;
+EXECUTE s;
+DEALLOCATE PREPARE s;
+SQL
+
+    run dolt sql -f migration.sql
+    [ "$status" -eq 0 ]
+
+    run dolt sql -q "SELECT c1 FROM one_pk WHERE pk=2" -r csv
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "55" ]] || false
+}
+
+@test "sql: EXECUTE of a failing prepared write reports the error" {
+    run dolt sql -q "PREPARE s FROM 'INSERT INTO one_pk (pk,c1,c2,c3,c4,c5) VALUES (0,0,0,0,0,0)'; EXECUTE s;"
+    [ "$status" -eq 1 ]
+    [[ "$output" =~ "duplicate primary key" ]] || false
+}
+
+@test "sql: EXECUTE of a prepared SELECT still returns results" {
+    run dolt sql -q "PREPARE s FROM 'SELECT count(*) AS n FROM one_pk'; EXECUTE s;" -r csv
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "4" ]] || false
+}

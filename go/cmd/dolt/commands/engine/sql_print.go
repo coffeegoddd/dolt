@@ -78,9 +78,12 @@ func prettyPrintResultsWithSummary(ctx *sql.Context, resultFormat PrintResultFor
 
 	// TODO: this isn't appropriate for JSON, CSV, other structured result formats
 	if isOkResult(sqlSch) {
-		// OkResult is only printed when we are in interactive terminal (TTY)
+		// OkResult is only printed when we are in interactive terminal (TTY). Even when we don't print it,
+		// the iterator must still be drained: statements whose row iterator is evaluated lazily (e.g. EXECUTE
+		// of a prepared INSERT/UPDATE/DELETE) only apply their writes as rows are pulled, so returning here
+		// without consuming the iterator silently discards the statement's effects.
 		if !printOkResult {
-			return nil
+			return drainIter(ctx, rowIter)
 		}
 		return printOKResult(ctx, rowIter, start)
 	}
@@ -319,6 +322,19 @@ func printOKResult(ctx *sql.Context, iter sql.RowIter, start time.Time) error {
 	}
 
 	return nil
+}
+
+// drainIter consumes rowIter to exhaustion, discarding the rows. Used for results we don't print but whose
+// evaluation still has to happen. Closing the iterator is left to the caller.
+func drainIter(ctx *sql.Context, iter sql.RowIter) error {
+	for {
+		_, err := iter.Next(ctx)
+		if err == io.EOF {
+			return nil
+		} else if err != nil {
+			return err
+		}
+	}
 }
 
 func isOkResult(sch sql.Schema) bool {
