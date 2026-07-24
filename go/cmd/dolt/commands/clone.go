@@ -174,6 +174,7 @@ func clone(ctx context.Context, apr *argparser.ArgParseResults, dEnv *env.DoltEn
 		// make best effort to delete the directory we created.
 		if userDirExists {
 			clonedEnv.FS.Delete(dbfactory.DoltDir, true)
+			_ = dbfactory.ClearDatabaseInProgress(clonedEnv.FS)
 		} else {
 			clonedEnv.FS.Delete(".", true)
 		}
@@ -192,6 +193,11 @@ func clone(ctx context.Context, apr *argparser.ArgParseResults, dEnv *env.DoltEn
 		Merge:  clonedEnv.RepoState.Head,
 		Remote: remoteName,
 	})
+	if err != nil {
+		return errhand.VerboseErrorFromError(err)
+	}
+
+	err = dbfactory.ClearDatabaseInProgress(clonedEnv.FS)
 	if err != nil {
 		return errhand.VerboseErrorFromError(err)
 	}
@@ -244,7 +250,7 @@ func createRemote(ctx context.Context, remoteName, remoteUrl string, params map[
 	if strings.TrimSpace(cloneRoot) != "" {
 		dialer = remoteDialerWithGitCacheRoot{GRPCDialProvider: dEnv, root: cloneRoot}
 	}
-	ddb, err := r.GetRemoteDB(ctx, types.Format_Default, dialer)
+	ddb, err := r.GetRemoteDB(ctx, types.Format_DOLT, dialer)
 	if err != nil {
 		bdr := errhand.BuildDError("error: failed to get remote db").AddCause(err)
 		return env.NoRemote, nil, bdr.Build()

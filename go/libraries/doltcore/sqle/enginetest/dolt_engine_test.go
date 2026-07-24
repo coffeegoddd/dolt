@@ -38,7 +38,6 @@ import (
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/dsess"
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/statspro"
 	"github.com/dolthub/dolt/go/libraries/utils/config"
-	"github.com/dolthub/dolt/go/store/types"
 )
 
 // SkipPreparedsCount is used by the "ci-check-repo CI workflow
@@ -105,7 +104,8 @@ func TestSchemaOverrides(t *testing.T) {
 // Provide additional test coverage for adaptive types by running Schema Override tests
 // using adaptive types instead of address types.
 func TestSchemaOverridesWithAdaptiveEncoding(t *testing.T) {
-	defer func() { typeinfo.UseAdaptiveEncoding = false }()
+	adaptiveEncoding := typeinfo.UseAdaptiveEncoding
+	defer func() { typeinfo.UseAdaptiveEncoding = adaptiveEncoding }()
 	typeinfo.UseAdaptiveEncoding = true
 	harness := newDoltEnginetestHarness(t)
 	RunSchemaOverridesTest(t, harness)
@@ -772,6 +772,12 @@ func TestIndexes(t *testing.T) {
 	enginetest.TestIndexes(t, harness)
 }
 
+func TestIndexedExpressions(t *testing.T) {
+	harness := newDoltHarness(t)
+	defer harness.Close()
+	enginetest.TestIndexedExpressions(t, harness)
+}
+
 func TestVectorIndexes(t *testing.T) {
 	harness := newDoltHarness(t)
 	defer harness.Close()
@@ -801,13 +807,16 @@ func TestBigBlobs(t *testing.T) {
 }
 
 func TestAdaptiveEncoding(t *testing.T) {
-	defer func() { typeinfo.UseAdaptiveEncoding = false }()
+	adaptiveEncoding := typeinfo.UseAdaptiveEncoding
+	defer func() { typeinfo.UseAdaptiveEncoding = adaptiveEncoding }()
 	typeinfo.UseAdaptiveEncoding = true
 
 	RunTestAdaptiveEncoding(t, newDoltHarness(t), AdaptiveEncodingTestType_Blob, AdaptiveEncodingTestPurpose_Representation)
 	RunTestAdaptiveEncoding(t, newDoltHarness(t), AdaptiveEncodingTestType_Blob, AdaptiveEncodingTestPurpose_Correctness)
 	RunTestAdaptiveEncoding(t, newDoltHarness(t), AdaptiveEncodingTestType_Text, AdaptiveEncodingTestPurpose_Representation)
 	RunTestAdaptiveEncoding(t, newDoltHarness(t), AdaptiveEncodingTestType_Text, AdaptiveEncodingTestPurpose_Correctness)
+
+	RunAdaptiveEncodingScripts(t, newDoltHarness(t))
 }
 
 func TestDropDatabase(t *testing.T) {
@@ -1073,6 +1082,17 @@ func TestLargeJsonObjects(t *testing.T) {
 	RunLargeJsonObjectsTest(t, harness)
 }
 
+// TestJsonAdaptiveEncoding exercises the JsonAdaptiveEnc storage path end-to-end,
+// covering small (inlined) and large (out-of-band) JSON documents.
+func TestJsonAdaptiveEncoding(t *testing.T) {
+	adaptiveEncoding := typeinfo.UseAdaptiveEncoding
+	defer func() { typeinfo.UseAdaptiveEncoding = adaptiveEncoding }()
+	typeinfo.UseAdaptiveEncoding = true
+
+	harness := newDoltEnginetestHarness(t)
+	RunJsonAdaptiveEncodingTests(t, harness)
+}
+
 func TestTransactions(t *testing.T) {
 	h := newDoltEnginetestHarness(t)
 	RunTransactionTests(t, h, false)
@@ -1116,10 +1136,15 @@ func TestConcurrentCreateDatabaseIfNotExists(t *testing.T) {
 	wg.Add(concurrency)
 	errs := make([]error, concurrency)
 
+	ctxs := make([]*sql.Context, concurrency)
+	for i := 0; i < concurrency; i++ {
+		ctxs[i] = enginetest.NewSession(harness)
+	}
+
 	for i := 0; i < concurrency; i++ {
 		go func(id int) {
 			defer wg.Done()
-			ctx := enginetest.NewSession(harness)
+			ctx := ctxs[id]
 			_, iter, _, err := engine.Query(ctx, "CREATE DATABASE IF NOT EXISTS newdb")
 			if err != nil {
 				errs[id] = err
@@ -1329,7 +1354,6 @@ func TestDoltReset(t *testing.T) {
 }
 
 func TestDoltGC(t *testing.T) {
-	t.SkipNow()
 	for _, script := range DoltGC {
 		func() {
 			h := newDoltHarness(t)
@@ -1669,11 +1693,10 @@ func TestNullRanges(t *testing.T) {
 }
 
 func TestPersist(t *testing.T) {
-	ctx := sql.NewEmptyContext()
 	harness := newDoltHarness(t)
 	defer harness.Close()
 	dEnv := dtestutils.CreateTestEnv()
-	defer dEnv.DoltDB(ctx).Close()
+	defer dEnv.Close()
 	localConf, ok := dEnv.Config.GetConfig(env.LocalConfig)
 	require.True(t, ok)
 	globals := config.NewPrefixConfig(localConf, env.SqlServerGlobalsPrefix)
@@ -1929,18 +1952,18 @@ func TestDoltVerifyConstraints(t *testing.T) {
 	RunDoltVerifyConstraintsTests(t, harness)
 }
 
+func TestDoltForeignKeyTests(t *testing.T) {
+	harness := newDoltEnginetestHarness(t)
+	RunDoltForeignKeyTests(t, harness)
+}
+
 func TestDoltStorageFormat(t *testing.T) {
 	h := newDoltEnginetestHarness(t)
 	RunDoltStorageFormatTests(t, h)
 }
 
 func TestDoltStorageFormatPrepared(t *testing.T) {
-	var expectedFormatString string
-	if types.IsFormat_DOLT(types.Format_Default) {
-		expectedFormatString = "NEW ( __DOLT__ )"
-	} else {
-		expectedFormatString = fmt.Sprintf("OLD ( %s )", types.Format_Default.VersionString())
-	}
+	expectedFormatString := "NEW ( __DOLT__ )"
 	h := newDoltHarness(t)
 	defer h.Close()
 	enginetest.TestPreparedQuery(t, h, "SELECT dolt_storage_format()", []sql.Row{{expectedFormatString}}, nil)

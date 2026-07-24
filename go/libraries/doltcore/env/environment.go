@@ -18,7 +18,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"maps"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -119,33 +118,19 @@ func NewDoltEnv(version string, config *DoltCliConfig, repoState *RepoState, dol
 // |dEnv.DBLoadError| will be non-nil. The caller is responsible for checking this error.
 func (dEnv *DoltEnv) DoltDB(ctx context.Context) *doltdb.DoltDB {
 	if dEnv.doltDB == nil {
-		LoadDoltDB(ctx, dEnv.FS, dEnv.urlStr, dEnv)
+		LoadDoltDB(ctx, dEnv)
 	}
 	return dEnv.doltDB
 }
 
-func (dEnv *DoltEnv) LoadDoltDBWithParams(ctx context.Context, nbf *types.NomsBinFormat, urlStr string, fs filesys.Filesys, params map[string]interface{}) error {
-	if dEnv.doltDB == nil {
-		if nbf == nil {
-			nbf = types.Format_Default
-		}
-		// Merge any environment-level DB load params without mutating the caller's map.
-		if len(dEnv.DBLoadParams) > 0 {
-			if params == nil {
-				params = maps.Clone(dEnv.DBLoadParams)
-			} else {
-				params = maps.Clone(params)
-				maps.Copy(params, dEnv.DBLoadParams)
-			}
-		}
-		ddb, err := doltdb.LoadDoltDBWithParams(ctx, nbf, urlStr, fs, params)
-		if err != nil {
-			dEnv.DBLoadError = err
-			return err
-		}
-		dEnv.doltDB = ddb
-		dEnv.urlStr = urlStr
-		dEnv.DBLoadError = nil
+// Close closes the *DoltEnv, and in particular the *DoltDB instance, if it has been loaded.
+// After calling this, DoltDB(ctx) will return `nil`. Close does not reset the sync.Once which
+// loading the database is gated behind.
+func (dEnv *DoltEnv) Close() error {
+	if dEnv != nil && dEnv.doltDB != nil {
+		err := dEnv.doltDB.Close()
+		dEnv.doltDB = nil
+		return err
 	}
 	return nil
 }
@@ -167,12 +152,8 @@ func IncompleteEnv(FS filesys.Filesys) *DoltEnv {
 	}
 }
 
-func (dEnv *DoltEnv) GetRemoteDB(ctx context.Context, format *types.NomsBinFormat, r Remote, withCaching bool) (*doltdb.DoltDB, error) {
-	if withCaching {
-		return r.GetRemoteDB(ctx, format, dEnv)
-	} else {
-		return r.GetRemoteDBWithoutCaching(ctx, format, dEnv)
-	}
+func (dEnv *DoltEnv) GetRemoteDB(ctx context.Context, format *types.NomsBinFormat, r Remote) (*doltdb.DoltDB, error) {
+	return r.GetRemoteDBWithoutCaching(ctx, format, dEnv)
 }
 
 func (dEnv *DoltEnv) GetConfig() config.ReadableConfig {
@@ -236,13 +217,12 @@ func LoadWithoutDB(_ context.Context, hdp HomeDirProvider, fs filesys.Filesys, u
 // Load loads the DoltEnv for the .dolt directory determined by resolving the specified urlStr with the specified Filesys.
 func Load(ctx context.Context, hdp HomeDirProvider, fs filesys.Filesys, urlStr string, version string) *DoltEnv {
 	dEnv := LoadWithoutDB(ctx, hdp, fs, urlStr, version)
-	LoadDoltDB(ctx, dEnv.FS, dEnv.urlStr, dEnv)
+	LoadDoltDB(ctx, dEnv)
 	return dEnv
 }
 
-func LoadDoltDB(ctx context.Context, fs filesys.Filesys, urlStr string, dEnv *DoltEnv) {
+func LoadDoltDB(ctx context.Context, dEnv *DoltEnv) {
 	dEnv.loadDBOnce.Do(func() {
-
 		mmapArchiveIndexes, err := dEnv.Config.GetBool(config.MmapArchiveIndexes, false)
 		if err != nil {
 			dEnv.DBLoadError = err
@@ -263,50 +243,52 @@ func LoadDoltDB(ctx context.Context, fs filesys.Filesys, urlStr string, dEnv *Do
 				params[k] = v
 			}
 		}
-		ddb, dbLoadErr := doltdb.LoadDoltDBWithParams(ctx, types.Format_Default, urlStr, fs, params)
+		ddb, dbLoadErr := doltdb.LoadDoltDBWithParams(ctx, types.Format_DOLT, dEnv.urlStr, dEnv.FS, params)
 		dEnv.doltDB = ddb
 		dEnv.DBLoadError = dbLoadErr
-		dEnv.urlStr = urlStr
 
-		if dbLoadErr == nil && dEnv.HasDoltDir() {
-			if !dEnv.HasDoltTempTableDir() {
-				tmpDir, err := dEnv.TempTableFilesDir()
-				if err != nil {
-					dEnv.DBLoadError = err
-				}
-				err = dEnv.FS.MkDirs(tmpDir)
-				dEnv.DBLoadError = err
-			} else {
-				// fire and forget cleanup routine.  Will delete as many old temp files as it can during the main commands execution.
-				// The process will not wait for this to finish so this may not always complete.
-				go func() {
-					// TODO dEnv.HasDoltTempTableDir() true but dEnv.TempTableFileDir() panics
-					tmpTableDir, err := dEnv.FS.Abs(filepath.Join(dEnv.urlStr, dbfactory.DoltDir, tempTablesDir))
+		if ddb != nil && ddb.AccessMode() != chunks.ExclusiveAccessMode_ReadOnly {
+			// Only do the following when we have write access to the database.
+			if dbLoadErr == nil && dEnv.HasDoltDir() {
+				if !dEnv.HasDoltTempTableDir() {
+					tmpDir, err := dEnv.TempTableFilesDir()
 					if err != nil {
-						return
+						dEnv.DBLoadError = err
 					}
-					_ = fs.Iter(tmpTableDir, true, func(path string, size int64, isDir bool) (stop bool) {
-						if !isDir {
-							lm, exists := fs.LastModified(path)
-
-							if exists && time.Now().Sub(lm) > (time.Hour*24) {
-								_ = fs.DeleteFile(path)
-							}
+					err = dEnv.FS.MkDirs(tmpDir)
+					dEnv.DBLoadError = err
+				} else {
+					// fire and forget cleanup routine.  Will delete as many old temp files as it can during the main commands execution.
+					// The process will not wait for this to finish so this may not always complete.
+					go func() {
+						// TODO dEnv.HasDoltTempTableDir() true but dEnv.TempTableFileDir() panics
+						tmpTableDir, err := dEnv.FS.Abs(filepath.Join(dEnv.urlStr, dbfactory.DoltDir, tempTablesDir))
+						if err != nil {
+							return
 						}
+						_ = dEnv.FS.Iter(tmpTableDir, true, func(path string, size int64, isDir bool) (stop bool) {
+							if !isDir {
+								lm, exists := dEnv.FS.LastModified(path)
 
-						return false
-					})
-				}()
+								if exists && time.Now().Sub(lm) > (time.Hour*24) {
+									_ = dEnv.FS.DeleteFile(path)
+								}
+							}
+
+							return false
+						})
+					}()
+				}
 			}
-		}
 
-		if dEnv.RSLoadErr == nil && dbLoadErr == nil {
-			// If the working set isn't present in the DB, create it from the repo state. This step can be removed post 1.0.
-			_, err := dEnv.WorkingSet(ctx)
-			if errors.Is(err, doltdb.ErrWorkingSetNotFound) {
-				_ = dEnv.initWorkingSetFromRepoState(ctx)
-			} else if err != nil {
-				dEnv.RSLoadErr = err
+			if dEnv.RSLoadErr == nil && dbLoadErr == nil {
+				// If the working set isn't present in the DB, create it from the repo state. This step can be removed post 1.0.
+				_, err := dEnv.WorkingSet(ctx)
+				if errors.Is(err, doltdb.ErrWorkingSetNotFound) {
+					_ = dEnv.initWorkingSetFromRepoState(ctx)
+				} else if err != nil {
+					dEnv.RSLoadErr = err
+				}
 			}
 		}
 	})
@@ -319,7 +301,21 @@ func GetDefaultInitBranch(cfg config.ReadableConfig) string {
 // Valid returns whether this environment has been properly initialized. This is useful because although every command
 // gets a DoltEnv, not all of them require it, and we allow invalid dolt envs to be passed around for this reason.
 func (dEnv *DoltEnv) Valid() bool {
-	return dEnv != nil && dEnv.CfgLoadErr == nil && dEnv.DBLoadError == nil && dEnv.HasDoltDir() && dEnv.HasDoltDataDir()
+	return dEnv != nil && dEnv.CfgLoadErr == nil && dEnv.RSLoadErr == nil && dEnv.DBLoadError == nil && dEnv.HasDoltDir() && dEnv.HasDoltDataDir()
+}
+
+// IsIncompleteDatabaseDir reports whether the database directory rooted at |fs| holds a database whose creation
+// never finished, either because it carries the in-progress marker or because it has Dolt storage without the
+// repo state file that every complete database has. Discovery ignores such a directory, so it cannot be served.
+func IsIncompleteDatabaseDir(fs filesys.Filesys) bool {
+	if dbfactory.IsDatabaseInProgress(fs) {
+		return true
+	}
+	if exists, isDir := fs.Exists(dbfactory.DoltDir); !exists || !isDir {
+		return false
+	}
+	exists, _ := fs.Exists(getRepoStateFile())
+	return !exists
 }
 
 // initWorkingSetFromRepoState sets the working set for the env's head to mirror the contents of the repo state file.
@@ -409,6 +405,9 @@ func (dEnv *DoltEnv) HasDoltDir() bool {
 }
 
 func (dEnv *DoltEnv) HasDoltDataDir() bool {
+	if dEnv == nil {
+		return false
+	}
 	exists, isDir := dEnv.FS.Exists(dbfactory.DoltDataDir)
 	return exists && isDir
 }
@@ -480,7 +479,7 @@ func (dEnv *DoltEnv) bestEffortDeleteAll(dir string) {
 // InitRepo takes an empty directory and initializes it with a .dolt directory containing repo state, uncommitted license and readme, and creates a noms
 // database with dolt structure.
 func (dEnv *DoltEnv) InitRepo(ctx context.Context, nbf *types.NomsBinFormat, name, email, branchName string) error { // should remove name and email args
-	return dEnv.InitRepoWithTime(ctx, nbf, name, email, branchName, datas.CommitterDate())
+	return dEnv.InitRepoWithTime(ctx, nbf, name, email, branchName, datas.CommitNow())
 }
 
 func (dEnv *DoltEnv) InitRepoWithTime(ctx context.Context, nbf *types.NomsBinFormat, name, email, branchName string, t time.Time) error { // should remove name and email args
@@ -521,7 +520,8 @@ func (dEnv *DoltEnv) InitRepoWithNoData(ctx context.Context, nbf *types.NomsBinF
 		return err
 	}
 
-	return dEnv.LoadDoltDBWithParams(ctx, nbf, dEnv.urlStr, dEnv.FS, nil)
+	LoadDoltDB(ctx, dEnv)
+	return dEnv.DBLoadError
 }
 
 var ErrCannotCreateDirDoesNotExist = errors.New("dir does not exist")
@@ -661,8 +661,9 @@ func (dEnv *DoltEnv) InitDBWithTime(ctx context.Context, nbf *types.NomsBinForma
 }
 
 func (dEnv *DoltEnv) InitDBWithCommitMetaGenerator(ctx context.Context, nbf *types.NomsBinFormat, branchName string, commitMeta datas.CommitMetaGenerator) error {
-	if err := dEnv.LoadDoltDBWithParams(ctx, nbf, dEnv.urlStr, dEnv.FS, nil); err != nil {
-		return err
+	LoadDoltDB(ctx, dEnv)
+	if dEnv.DBLoadError != nil {
+		return dEnv.DBLoadError
 	}
 
 	err := dEnv.DoltDB(ctx).WriteEmptyRepoWithCommitMetaGenerator(ctx, branchName, commitMeta)

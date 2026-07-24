@@ -56,13 +56,13 @@ func createFulltextTable(ctx *sql.Context, name string, root doltdb.RootValue) (
 	if err != nil {
 		return nil, err
 	}
-	sqlSch, err := sqlutil.FromDoltSchema("", name, sch)
+	sqlSch, err := sqlutil.FromDoltSchema(ctx, "", name, sch)
 	if err != nil {
 		return nil, err
 	}
 
 	gmsDb := memory.NewDatabase("gms_db")
-	gmsTable := memory.NewLocalTable(gmsDb, name, sqlSch, nil)
+	gmsTable := memory.NewLocalTable(ctx, gmsDb, name, sqlSch, nil)
 	return &fulltextTable{
 		GMSTable: gmsTable,
 		Table:    tbl,
@@ -82,8 +82,8 @@ func (table *fulltextTable) String() string {
 }
 
 // Schema implements the interface fulltext.EditableTable.
-func (table *fulltextTable) Schema() sql.Schema {
-	return table.GMSTable.Schema()
+func (table *fulltextTable) Schema(ctx *sql.Context) sql.Schema {
+	return table.GMSTable.Schema(ctx)
 }
 
 // Collation implements the interface fulltext.EditableTable.
@@ -162,7 +162,7 @@ func (table *fulltextTable) ApplyToTable(ctx *sql.Context) (*doltdb.Table, error
 				return nil, err
 			}
 		}
-		k, err := keyBld.Build(sharePool)
+		k, err := keyBld.Build(ctx, sharePool)
 		if err != nil {
 			return nil, err
 		}
@@ -173,7 +173,7 @@ func (table *fulltextTable) ApplyToTable(ctx *sql.Context) (*doltdb.Table, error
 				return nil, err
 			}
 		}
-		v, err := valBld.Build(sharePool)
+		v, err := valBld.Build(ctx, sharePool)
 		if err != nil {
 			return nil, err
 		}

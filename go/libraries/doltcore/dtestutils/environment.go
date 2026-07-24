@@ -98,14 +98,14 @@ func createTestEnvWithNameAndFilesystem(envName string, fs filesys.Filesys, home
 		urlStr = doltdb.LocalDirDoltDB
 	}
 
-	dEnv := env.Load(context.Background(), homeDirFunc, fs, urlStr, "test")
+	dEnv := env.LoadWithoutDB(context.Background(), homeDirFunc, fs, urlStr, "test")
 	cfg, _ := dEnv.Config.GetConfig(env.GlobalConfig)
 	cfg.SetStrings(map[string]string{
 		config.UserNameKey:  name,
 		config.UserEmailKey: email,
 	})
 
-	err := dEnv.InitRepo(context.Background(), types.Format_Default, name, email, env.DefaultInitBranch)
+	err := dEnv.InitRepo(context.Background(), types.Format_DOLT, name, email, env.DefaultInitBranch)
 	if err != nil {
 		panic("Failed to initialize environment:" + err.Error())
 	}

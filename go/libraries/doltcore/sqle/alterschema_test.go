@@ -83,7 +83,7 @@ func TestRenameTable(t *testing.T) {
 		t.Run(tt.description, func(t *testing.T) {
 			ctx := context.Background()
 			dEnv := dtestutils.CreateTestEnv()
-			defer dEnv.DoltDB(ctx).Close()
+			defer dEnv.Close()
 			root, err := dEnv.WorkingRoot(ctx)
 			require.NoError(t, err)
 
@@ -222,7 +222,7 @@ func TestAddColumnToTable(t *testing.T) {
 			ctx := context.Background()
 			dEnv, err := makePeopleTable(ctx, dtestutils.CreateTestEnv())
 			require.NoError(t, err)
-			defer dEnv.DoltDB(ctx).Close()
+			defer dEnv.Close()
 
 			root, err := dEnv.WorkingRoot(ctx)
 			require.NoError(t, err)
@@ -245,7 +245,7 @@ func TestAddColumnToTable(t *testing.T) {
 			index := sch.Indexes().GetByName(dtestutils.IndexName)
 			assert.NotNil(t, index)
 			tt.expectedSchema.Indexes().AddIndex(index)
-			_, err = tt.expectedSchema.Checks().AddCheck("test-check", "age < 123", true)
+			_, err = tt.expectedSchema.Checks().AddCheck("test-check", "age < 123", true, false)
 			require.NoError(t, err)
 			require.True(t, schema.SchemasAreEqual(tt.expectedSchema, sch))
 		})
@@ -426,7 +426,7 @@ func TestDropPks(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			ctx := context.Background()
 			dEnv := dtestutils.CreateTestEnv()
-			defer dEnv.DoltDB(ctx).Close()
+			defer dEnv.Close()
 
 			db, err := NewDatabase(ctx, "dolt", dEnv.DbData(ctx), editor.Options{})
 			require.NoError(t, err)
@@ -457,7 +457,7 @@ func TestDropPks(t *testing.T) {
 				foreignKeyCollection, err := root.GetForeignKeyCollection(ctx)
 				assert.NoError(t, err)
 
-				fk, ok := foreignKeyCollection.GetByNameCaseInsensitive(childFkName)
+				fk, ok := foreignKeyCollection.GetByNameCaseInsensitive(childFkName, doltdb.TableName{Name: childName})
 				assert.True(t, ok)
 				assert.Equal(t, childName, fk.TableName.Name)
 				if tt.fkIdxName != "" && fk.ReferencedTableIndex != "" {
@@ -736,7 +736,7 @@ func TestModifyColumn(t *testing.T) {
 			ctx := context.Background()
 			dEnv, err := makePeopleTable(ctx, dtestutils.CreateTestEnv())
 			require.NoError(t, err)
-			defer dEnv.DoltDB(ctx).Close()
+			defer dEnv.Close()
 
 			root, err := dEnv.WorkingRoot(ctx)
 			assert.NoError(t, err)
@@ -758,7 +758,7 @@ func TestModifyColumn(t *testing.T) {
 			tt.expectedSchema.Indexes().AddIndex(index)
 			err = tt.expectedSchema.SetPkOrdinals(sch.GetPkOrdinals())
 			require.NoError(t, err)
-			_, err = tt.expectedSchema.Checks().AddCheck("test-check", "age < 123", true)
+			_, err = tt.expectedSchema.Checks().AddCheck("test-check", "age < 123", true, false)
 			require.NoError(t, err)
 			require.True(t, schema.SchemasAreEqual(tt.expectedSchema, sch))
 		})

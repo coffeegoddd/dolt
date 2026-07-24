@@ -404,7 +404,9 @@ func (sc *StatsController) collectIndexNodes(ctx *sql.Context, prollyMap prolly.
 						keyBuilder.PutRaw(i, keyBytes.GetField(i))
 					}
 
-					updater.add(ctx, keyBuilder.BuildPrefixNoRecycle(prollyMap.Pool(), updater.prefixLen))
+					if err := updater.add(ctx, keyBuilder.BuildPrefixNoRecycle(prollyMap.Pool(), updater.prefixLen)); err != nil {
+						return err
+					}
 					keyBuilder.Recycle()
 				}
 
@@ -533,6 +535,7 @@ func (sc *StatsController) updateTable(ctx *sql.Context, newStats *rootStats, ta
 		}
 
 		template.Qual.Database = sqlDb.AliasedName()
+		template.Qual.Sch = sqlDb.SchemaName()
 
 		idxLen := len(sqlIdx.Expressions())
 
@@ -632,7 +635,7 @@ func (sc *StatsController) getTemplate(ctx *sql.Context, sqlTable *sqle.DoltTabl
 	if template, ok := sc.GetTemplate(key); ok {
 		return key, template, nil
 	}
-	fds, colset, err := stats.IndexFds(strings.ToLower(sqlTable.Name()), sqlTable.Schema(), sqlIdx)
+	fds, colset, err := stats.IndexFds(ctx, strings.ToLower(sqlTable.Name()), sqlTable.Schema(ctx), sqlIdx)
 	if err != nil {
 		return templateCacheKey{}, stats.Statistic{}, err
 	}
@@ -648,7 +651,7 @@ func (sc *StatsController) getTemplate(ctx *sql.Context, sqlTable *sqle.DoltTabl
 	}
 
 	var types []sql.Type
-	for _, cet := range sqlIdx.ColumnExpressionTypes() {
+	for _, cet := range sqlIdx.ColumnExpressionTypes(ctx) {
 		types = append(types, cet.Type)
 	}
 

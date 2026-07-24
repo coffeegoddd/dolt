@@ -15,6 +15,7 @@
 package kvexec
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"strings"
@@ -112,7 +113,7 @@ func (l *lookupJoinKvIter) Next(ctx *sql.Context) (sql.Row, error) {
 				return nil, io.EOF
 			}
 
-			l.dstKey, err = l.keyTupleMapper.dstKeyTuple(l.srcKey, l.srcVal)
+			l.dstKey, err = l.keyTupleMapper.dstKeyTuple(ctx, l.srcKey, l.srcVal)
 			if err != nil {
 				return nil, err
 			}
@@ -220,7 +221,7 @@ func newLookupKeyMapping(
 	srcMapping := make(val.OrdinalMapping, len(keyExprs))
 	var litMappings val.OrdinalMapping
 	var litTypes []val.Type
-	tda := val.TupleDescriptorArgs{}
+	tda := val.TupleDescriptorArgs{ValueStore: ns}
 
 	for i, e := range keyExprs {
 		switch e := e.(type) {
@@ -267,7 +268,7 @@ func newLookupKeyMapping(
 	var litTuple val.Tuple
 	var err error
 	if litDesc.Count() > 0 {
-		litTuple, err = litTb.Build(ns.Pool())
+		litTuple, err = litTb.Build(ctx, ns.Pool())
 		if err != nil {
 			return nil, err
 		}
@@ -291,13 +292,13 @@ func newLookupKeyMapping(
 // convertLiteralKeyValue converts a literal expression value to the appropriate type for the reference column
 // in a key lookup
 func convertLiteralKeyValue(ctx *sql.Context, colTyp sql.ColumnExpressionType, literal *expression.Literal) (any, sql.ConvertInRange, error) {
-	srcType := literal.Type()
+	srcType := literal.Type(ctx)
 	destType := colTyp.Type
 
 	// For extended types, use the rich type conversion methods
 	if srcEt, ok := srcType.(sql.ExtendedType); ok {
 		if destEt, ok := destType.(sql.ExtendedType); ok {
-			return destEt.ConvertToType(ctx, srcEt, literal.Value())
+			return destEt.ConvertToType(ctx, srcEt, literal.Value(), 'a')
 		}
 	}
 	return destType.Convert(ctx, literal.Value())
@@ -305,7 +306,7 @@ func convertLiteralKeyValue(ctx *sql.Context, colTyp sql.ColumnExpressionType, l
 
 // valid returns whether the source and destination key types
 // are type compatible
-func (m *lookupMapping) valid() bool {
+func (m *lookupMapping) valid(ctx *sql.Context) bool {
 	if m == nil {
 		return false
 	}
@@ -334,7 +335,7 @@ func (m *lookupMapping) valid() bool {
 		switch desc.Types[from].Enc {
 		case val.ExtendedAddrEnc, val.ExtendedEnc, val.ExtendedAdaptiveEnc:
 			toTyp := m.idxColTyps[from].Type
-			fromTyp := m.keyExprs[from].Type()
+			fromTyp := m.keyExprs[from].Type(ctx)
 			// this is more conservative than it needs to be, we want to assert these values are byte-compatible
 			return toTyp == fromTyp
 		}
@@ -342,7 +343,7 @@ func (m *lookupMapping) valid() bool {
 	return true
 }
 
-func (m *lookupMapping) dstKeyTuple(srcKey, srcVal val.Tuple) (val.Tuple, error) {
+func (m *lookupMapping) dstKeyTuple(ctx context.Context, srcKey, srcVal val.Tuple) (val.Tuple, error) {
 	var litIdx int
 	for to := range m.srcMapping {
 		from := m.srcMapping.MapOrdinal(to)
@@ -372,5 +373,5 @@ func (m *lookupMapping) dstKeyTuple(srcKey, srcVal val.Tuple) (val.Tuple, error)
 		}
 	}
 
-	return m.targetKb.BuildPermissive(m.pool)
+	return m.targetKb.BuildPermissive(ctx, m.pool)
 }

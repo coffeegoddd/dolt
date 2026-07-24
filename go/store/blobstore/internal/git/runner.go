@@ -113,14 +113,20 @@ func (e *CmdError) Error() string {
 
 func (e *CmdError) Unwrap() error { return e.Cause }
 
-// Run executes "git <args...>" with GIT_DIR set and returns captured combined output
-// when Stdout/Stderr are not supplied.
-func (r *Runner) Run(ctx context.Context, opts RunOptions, args ...string) ([]byte, error) {
+func (r *Runner) buildCmd(ctx context.Context, opts RunOptions, args []string) *exec.Cmd {
 	cmd := exec.CommandContext(ctx, r.gitPath, args...) //nolint:gosec // args are controlled by caller; used for internal plumbing.
 	if opts.Dir != "" {
 		cmd.Dir = opts.Dir
 	}
 	cmd.Env = r.env(opts)
+	gitauth.CmdSetsid(cmd)
+	return cmd
+}
+
+// Run executes "git <args...>" with GIT_DIR set and returns captured combined output
+// when Stdout/Stderr are not supplied.
+func (r *Runner) Run(ctx context.Context, opts RunOptions, args ...string) ([]byte, error) {
+	cmd := r.buildCmd(ctx, opts, args)
 
 	if opts.Stdin != nil {
 		cmd.Stdin = opts.Stdin
@@ -172,11 +178,7 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions, args ...string) ([]by
 //   - The returned *exec.Cmd is provided for advanced uses (e.g. signals), but most
 //     callers should not call Wait() directly.
 func (r *Runner) Start(ctx context.Context, opts RunOptions, args ...string) (io.ReadCloser, *exec.Cmd, error) {
-	cmd := exec.CommandContext(ctx, r.gitPath, args...) //nolint:gosec // args are controlled by caller; used for internal plumbing.
-	if opts.Dir != "" {
-		cmd.Dir = opts.Dir
-	}
-	cmd.Env = r.env(opts)
+	cmd := r.buildCmd(ctx, opts, args)
 	if opts.Stdin != nil {
 		cmd.Stdin = opts.Stdin
 	}
@@ -206,19 +208,32 @@ func (r *Runner) Start(ctx context.Context, opts RunOptions, args ...string) (io
 }
 
 type cmdReadCloser struct {
-	r      io.ReadCloser
-	cmd    *exec.Cmd
-	stderr *bytes.Buffer
-	args   []string
-	dir    string
+	r       io.ReadCloser
+	cmd     *exec.Cmd
+	stderr  *bytes.Buffer
+	args    []string
+	dir     string
+	drained bool // set once Read reaches io.EOF, so stdout was fully consumed
 }
 
-func (c *cmdReadCloser) Read(p []byte) (int, error) { return c.r.Read(p) }
+func (c *cmdReadCloser) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	if errors.Is(err, io.EOF) {
+		c.drained = true
+	}
+	return n, err
+}
 
 func (c *cmdReadCloser) Close() error {
 	_ = c.r.Close()
 	err := c.cmd.Wait()
 	if err == nil {
+		return nil
+	}
+	// A close before stdout was drained kills the still writing child with a closed
+	// pipe, which is expected. Checking our own drained flag is portable, while the
+	// child's exit text names the broken pipe signal only on Unix.
+	if !c.drained {
 		return nil
 	}
 	exitCode := 0

@@ -33,17 +33,17 @@ import (
 // ResolveDefaultExpression returns a sql.Expression for the column default or generated expression for the
 // column provided
 func ResolveDefaultExpression(ctx *sql.Context, tableName string, sch schema.Schema, col schema.Column) (sql.Expression, error) {
-	ct, err := parseCreateTable(ctx, tableName, sch)
+	resolved, err := ResolveSchema(ctx, tableName, sch)
 	if err != nil {
 		return nil, err
 	}
 
-	colIdx := ct.PkSchema().Schema.IndexOfColName(col.Name)
+	colIdx := resolved.IndexOfColName(col.Name)
 	if colIdx < 0 {
 		return nil, fmt.Errorf("unable to find column %s in analyzed query", col.Name)
 	}
 
-	sqlCol := ct.PkSchema().Schema[colIdx]
+	sqlCol := resolved[colIdx]
 	expr := sqlCol.Default
 	if expr == nil || expr.Expr == nil {
 		expr = sqlCol.Generated
@@ -56,6 +56,15 @@ func ResolveDefaultExpression(ctx *sql.Context, tableName string, sch schema.Sch
 	return expr, nil
 }
 
+// ResolveSchema returns the sql.Schema for |sch| with its column default and generated expressions resolved.
+func ResolveSchema(ctx *sql.Context, tableName string, sch schema.Schema) (sql.Schema, error) {
+	ct, err := parseCreateTable(ctx, tableName, sch)
+	if err != nil {
+		return nil, err
+	}
+	return ct.PkSchema().Schema, nil
+}
+
 // ResolveCheckExpression returns a sql.Expression for the check provided
 func ResolveCheckExpression(ctx *sql.Context, tableName string, sch schema.Schema, checkExpr string) (sql.Expression, error) {
 	ct, err := parseCreateTable(ctx, tableName, sch)
@@ -66,8 +75,8 @@ func ResolveCheckExpression(ctx *sql.Context, tableName string, sch schema.Schem
 	formatter := overrides.SchemaFormatterFromContext(ctx)
 	for _, check := range ct.Checks() {
 		// Check definitions created before v1.55.3 may not have backquotes around identifiers
-		quotedExpr := stripTableNamesFromExpression(formatter, check.Expr, true).String()
-		unquotedExpr := stripTableNamesFromExpression(formatter, check.Expr, false).String()
+		quotedExpr := stripTableNamesFromExpression(ctx, formatter, check.Expr, true).String()
+		unquotedExpr := stripTableNamesFromExpression(ctx, formatter, check.Expr, false).String()
 		if quotedExpr == checkExpr || unquotedExpr == checkExpr {
 			return check.Expr, nil
 		}
@@ -76,8 +85,41 @@ func ResolveCheckExpression(ctx *sql.Context, tableName string, sch schema.Schem
 	return nil, fmt.Errorf("unable to find check expression")
 }
 
-func stripTableNamesFromExpression(formatter sql.SchemaFormatter, expr sql.Expression, quoted bool) sql.Expression {
-	e, _, _ := transform.Expr(expr, func(e sql.Expression) (sql.Expression, transform.TreeIdentity, error) {
+// ResolveExpression compiles a predicate or check constraint string into a sql.Expression resolved.
+// Used to re-hydrate partial index predicates and check expressions from their string representation.
+// It uses SELECT statement on the expression FROM given table.
+func ResolveExpression(ctx *sql.Context, tableName string, predicateStr string) (sql.Expression, error) {
+	// TODO: added * in SELECT stmt to avoid pruning columns during analyzer.
+	parsed, err := parseQuery(ctx, fmt.Sprintf("SELECT *, %s FROM %s", predicateStr, tableName))
+	if err != nil {
+		return nil, err
+	}
+
+	sess, ok := ctx.Session.(SessionDbProvider)
+	if ok {
+		// field index in GetField is incorrect, it needs `fix_exec_indexes` analyzer rule
+		a := analyzer.NewDefault(sess.GenericProvider())
+		parsed, err = a.Analyze(ctx, parsed, nil, nil)
+		if err != nil {
+			return nil, err
+		}
+		// comes out in ContextRootFinalizer, so unwrap it
+		parsed = parsed.Children()[0]
+	}
+
+	proj, ok := parsed.(*plan.Project)
+	if !ok {
+		return nil, fmt.Errorf("expected *plan.Project parsing predicate, got %T", parsed)
+	}
+	expr := proj.Projections[len(proj.Projections)-1]
+	if alias, ok := expr.(*expression.Alias); ok {
+		expr = alias.Child
+	}
+	return expr, nil
+}
+
+func stripTableNamesFromExpression(ctx *sql.Context, formatter sql.SchemaFormatter, expr sql.Expression, quoted bool) sql.Expression {
+	e, _, _ := transform.Expr(ctx, expr, func(ctx *sql.Context, e sql.Expression) (sql.Expression, transform.TreeIdentity, error) {
 		if col, ok := e.(*expression.GetField); ok {
 			return col.WithTable("").WithQuotedNames(formatter, quoted), transform.NewTree, nil
 		}
@@ -97,8 +139,19 @@ func parseCreateTable(ctx *sql.Context, tableName string, sch schema.Schema) (*p
 		return nil, err
 	}
 
-	query := createTable
+	pseudoAnalyzedQuery, err := parseQuery(ctx, createTable)
+	if err != nil {
+		return nil, err
+	}
 
+	ct, ok := pseudoAnalyzedQuery.(*plan.CreateTable)
+	if !ok {
+		return nil, fmt.Errorf("expected a *plan.CreateTable node, but got %T", pseudoAnalyzedQuery)
+	}
+	return ct, nil
+}
+
+func parseQuery(ctx *sql.Context, query string) (sql.Node, error) {
 	// Doltgres must use the existing provider due to custom functions, so we split the logic here depending on whether
 	// this is being called from a query context (which will have a valid Dolt session) or some other context (which
 	// will need to construct a new provider).
@@ -125,10 +178,5 @@ func parseCreateTable(ctx *sql.Context, tableName string, sch schema.Schema) (*p
 	if err != nil {
 		return nil, err
 	}
-
-	ct, ok := pseudoAnalyzedQuery.(*plan.CreateTable)
-	if !ok {
-		return nil, fmt.Errorf("expected a *plan.CreateTable node, but got %T", pseudoAnalyzedQuery)
-	}
-	return ct, nil
+	return pseudoAnalyzedQuery, nil
 }

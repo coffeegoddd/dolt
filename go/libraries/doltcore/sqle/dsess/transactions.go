@@ -127,16 +127,20 @@ func NewDoltTransaction(
 	}, nil
 }
 
-// AddDb adds the database named to the transaction. Only necessary in the case when new databases are added to an
-// existing transaction (as when cloning a database on a read replica when it is first referenced).
+// AddDb adds the database named to the transaction, establishing a start-point root for it. Necessary when a database
+// becomes visible to a session after its transaction has already begun: when cloning a database on a read replica as it
+// is first referenced, or when another session created the database concurrently after this transaction's snapshot was
+// taken. The key is normalized to the base (non-revision-qualified, lowercased) name to match NewDoltTransaction and
+// GetInitialRoot, since db.Name() returns the user-requested name, which may be revision-qualified or differently cased.
 func (tx DoltTransaction) AddDb(ctx *sql.Context, db SqlDatabase) error {
 	nomsRoot, err := db.DbData().Ddb.NomsRoot(ctx)
 	if err != nil {
 		return err
 	}
 
-	tx.dbStartPoints[strings.ToLower(db.Name())] = dbRoot{
-		dbName:   db.Name(),
+	baseName, _ := doltdb.SplitRevisionDbName(db.Name())
+	tx.dbStartPoints[strings.ToLower(baseName)] = dbRoot{
+		dbName:   baseName,
 		rootHash: nomsRoot,
 		db:       db.DbData().Ddb,
 	}
@@ -271,8 +275,13 @@ func doltCommit(ctx *sql.Context,
 
 	workingSet = workingSet.ClearMerge()
 
+	name, email, _, _, err := ResolveNameEmail(ctx, DoltCommitterName, DoltCommitterEmail)
+	if err != nil {
+		return nil, nil, err
+	}
+
 	var rsc doltdb.ReplicationStatusController
-	newCommit, err := doltDb.CommitWithWorkingSet(ctx, headRef, workingSet.Ref(), &pending, workingSet, currHash, tx.WorkingSetMeta(ctx), &rsc)
+	newCommit, err := doltDb.CommitWithWorkingSet(ctx, headRef, workingSet.Ref(), &pending, workingSet, currHash, tx.WorkingSetMeta(name, email), &rsc)
 	WaitForReplicationController(ctx, rsc)
 	return workingSet, newCommit, err
 }
@@ -288,8 +297,13 @@ func txCommit(ctx *sql.Context,
 	hash hash.Hash, // hash of the current working set to be written
 	_ editor.Options, // editor options for merges
 ) (*doltdb.WorkingSet, *doltdb.Commit, error) {
+	name, email, _, _, err := ResolveNameEmail(ctx, DoltCommitterName, DoltCommitterEmail)
+	if err != nil {
+		return nil, nil, err
+	}
+
 	var rsc doltdb.ReplicationStatusController
-	err := doltDb.UpdateWorkingSet(ctx, workingSet.Ref(), workingSet, hash, tx.WorkingSetMeta(ctx), &rsc)
+	err = doltDb.UpdateWorkingSet(ctx, workingSet.Ref(), workingSet, hash, tx.WorkingSetMeta(name, email), &rsc)
 	WaitForReplicationController(ctx, rsc)
 	return workingSet, nil, err
 }
@@ -809,12 +823,11 @@ func (tx *DoltTransaction) ClearSavepoint(name string) bool {
 	return false
 }
 
-// WorkingSetMeta returns the metadata to use for a commit of this transaction
-func (tx DoltTransaction) WorkingSetMeta(ctx *sql.Context) *datas.WorkingSetMeta {
-	sess := DSessFromSess(ctx.Session)
+// WorkingSetMeta returns the metadata to use for a commit of this transaction.
+func (tx DoltTransaction) WorkingSetMeta(name, email string) *datas.WorkingSetMeta {
 	return &datas.WorkingSetMeta{
-		Name:        sess.Username(),
-		Email:       sess.Email(),
+		Name:        name,
+		Email:       email,
 		Timestamp:   uint64(time.Now().Unix()),
 		Description: "sql transaction",
 	}

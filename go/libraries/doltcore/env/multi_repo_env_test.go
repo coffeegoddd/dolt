@@ -101,14 +101,14 @@ func initRepoWithRelativePath(t *testing.T, envPath string, hdp HomeDirProvider)
 	require.NoError(t, err)
 
 	urlStr := earl.FileUrlFromPath(filepath.Join(envPath, ".dolt", "noms"), os.PathSeparator)
-	dEnv := Load(context.Background(), hdp, fs, urlStr, "test")
+	dEnv := LoadWithoutDB(context.Background(), hdp, fs, urlStr, "test")
 	cfg, _ := dEnv.Config.GetConfig(GlobalConfig)
 	cfg.SetStrings(map[string]string{
 		config.UserNameKey:  name,
 		config.UserEmailKey: email,
 	})
 
-	err = dEnv.InitRepo(context.Background(), types.Format_Default, name, email, DefaultInitBranch)
+	err = dEnv.InitRepo(context.Background(), types.Format_DOLT, name, email, DefaultInitBranch)
 	require.NoError(t, err)
 
 	return Load(context.Background(), hdp, fs, urlStr, "test")
@@ -122,7 +122,7 @@ func TestMultiEnvForDirectory(t *testing.T) {
 	envPath := filepath.Join(rootPath, " test---name _ 123")
 	dEnv := initRepoWithRelativePath(t, envPath, hdp)
 
-	mrEnv, err := MultiEnvForDirectory(context.Background(), dEnv.Config.WriteableConfig(), dEnv.FS, dEnv.Version, dEnv)
+	mrEnv, err := MultiEnvForDirectory(context.Background(), dEnv.FS, dEnv)
 	require.NoError(t, err)
 	assert.Len(t, mrEnv.envs, 1)
 
@@ -159,7 +159,7 @@ func TestMultiEnvForDirectoryWithMultipleRepos(t *testing.T) {
 	subEnv1 := initRepoWithRelativePath(t, filepath.Join(envPath, "abc"), hdp)
 	subEnv2 := initRepoWithRelativePath(t, filepath.Join(envPath, "def"), hdp)
 
-	mrEnv, err := MultiEnvForDirectory(context.Background(), dEnv.Config.WriteableConfig(), dEnv.FS, dEnv.Version, dEnv)
+	mrEnv, err := MultiEnvForDirectory(context.Background(), dEnv.FS, dEnv)
 	require.NoError(t, err)
 	assert.Len(t, mrEnv.envs, 3)
 
@@ -186,12 +186,22 @@ func TestMultiRepoEnvClose(t *testing.T) {
 	_ = initRepoWithRelativePath(t, filepath.Join(envPath, "sub_db"), hdp)
 
 	ctx := context.Background()
-	mrEnv, err := MultiEnvForDirectory(ctx, dEnv.Config.WriteableConfig(), dEnv.FS, dEnv.Version, dEnv)
+	mrEnv, err := MultiEnvForDirectory(ctx, dEnv.FS, dEnv)
 	require.NoError(t, err)
 	assert.Len(t, mrEnv.envs, 2)
 
 	err = mrEnv.Close(ctx)
 	require.NoError(t, err)
+}
+
+func TestMultiEnvForConfigAndDirectory_EmptyFS(t *testing.T) {
+	ctx := context.Background()
+	fs := filesys.EmptyInMemFS("/")
+	cfg := config.NewMapConfig(map[string]string{})
+
+	mrEnv, err := MultiEnvForConfigAndDirectory(ctx, cfg, fs, nil)
+	require.NoError(t, err)
+	assert.Empty(t, mrEnv.envs)
 }
 
 func initMultiEnv(t *testing.T, testName string, names []string) (string, HomeDirProvider, map[string]*DoltEnv) {
@@ -207,4 +217,44 @@ func initMultiEnv(t *testing.T, testName string, names []string) (string, HomeDi
 	}
 
 	return rootPath, hdp, envs
+}
+
+func TestMultiEnvForDirectorySkipsOrphanedDatabase(t *testing.T) {
+	// See https://github.com/dolthub/dolt/issues/11206
+	cases := []struct {
+		name       string
+		makeOrphan func(t *testing.T, mainPath string, hdp HomeDirProvider)
+	}{
+		{"missing repo state", func(t *testing.T, mainPath string, hdp HomeDirProvider) {
+			nomsDir := filepath.Join(mainPath, "orphan", dbfactory.DoltDir, dbfactory.DataDir)
+			require.NoError(t, os.MkdirAll(nomsDir, os.ModePerm))
+			require.NoError(t, os.WriteFile(filepath.Join(nomsDir, "LOCK"), nil, 0o644))
+		}},
+		{"in-progress marker", func(t *testing.T, mainPath string, hdp HomeDirProvider) {
+			_ = initRepoWithRelativePath(t, filepath.Join(mainPath, "orphan"), hdp)
+			require.NoError(t, os.WriteFile(filepath.Join(mainPath, "orphan", ".dolt_safe_to_ignore"), nil, 0o644))
+		}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rootPath, err := test.ChangeToTestDir("TestMultiEnvForDirectorySkipsOrphanedDatabase")
+			require.NoError(t, err)
+
+			hdp := func() (string, error) { return rootPath, nil }
+			mainPath := filepath.Join(rootPath, "main_db")
+			dEnv := initRepoWithRelativePath(t, mainPath, hdp)
+			_ = initRepoWithRelativePath(t, filepath.Join(mainPath, "good"), hdp)
+
+			tc.makeOrphan(t, mainPath, hdp)
+
+			mrEnv, err := MultiEnvForDirectory(context.Background(), dEnv.FS, dEnv)
+			require.NoError(t, err)
+
+			require.Len(t, mrEnv.envs, 2)
+			for _, namedEnv := range mrEnv.envs {
+				assert.NotEqual(t, "orphan", namedEnv.name)
+			}
+		})
+	}
 }

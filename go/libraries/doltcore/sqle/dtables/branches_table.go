@@ -163,7 +163,7 @@ func (bt *BranchesTable) GetReferencedForeignKeys(ctx *sql.Context) ([]sql.Forei
 		return nil, fmt.Errorf("unable to get roots for database '%s'", databaseName)
 	}
 
-	pkSch := sql.NewPrimaryKeySchema(bt.Schema(), 0)
+	pkSch := sql.NewPrimaryKeySchema(bt.Schema(ctx), 0)
 	tableName := doltdb.TableName{Name: "dolt_branches"}
 	doltSchema, err := sqlutil.ToDoltSchema(ctx, roots.Working, tableName, pkSch, roots.Head, bt.Collation())
 	if err != nil {
@@ -179,7 +179,7 @@ func (bt *BranchesTable) AddForeignKey(ctx *sql.Context, fk sql.ForeignKeyConstr
 }
 
 // DropForeignKey implements sql.ForeignKeyTable
-func (bt *BranchesTable) DropForeignKey(ctx *sql.Context, fkName string) error {
+func (bt *BranchesTable) DropForeignKey(ctx *sql.Context, fkName string, tableName string, schemaName string) error {
 	return fmt.Errorf("dolt system tables do not support dropping foreign keys")
 }
 
@@ -206,7 +206,7 @@ func NewRemoteBranchesTable(_ *sql.Context, ddb dsess.SqlDatabase, tableName str
 }
 
 func (bt *BranchesTable) DataLength(ctx *sql.Context) (uint64, error) {
-	numBytesPerRow := schema.SchemaAvgLength(bt.Schema())
+	numBytesPerRow := schema.SchemaAvgLength(bt.Schema(ctx))
 	numRows, _, err := bt.RowCount(ctx)
 	if err != nil {
 		return 0, err
@@ -229,7 +229,7 @@ func (bt *BranchesTable) String() string {
 }
 
 // Schema is a sql.Table interface function that gets the sql.Schema of the branches system table
-func (bt *BranchesTable) Schema() sql.Schema {
+func (bt *BranchesTable) Schema(ctx *sql.Context) sql.Schema {
 	columns := []*sql.Column{
 		{Name: "name", Type: types.Text, Source: bt.tableName, PrimaryKey: true, Nullable: false, DatabaseSource: bt.db.Name()},
 		{Name: "hash", Type: types.Text, Source: bt.tableName, PrimaryKey: false, Nullable: false, DatabaseSource: bt.db.Name()},
@@ -243,6 +243,11 @@ func (bt *BranchesTable) Schema() sql.Schema {
 		columns = append(columns, &sql.Column{Name: "branch", Type: types.Text, Source: bt.tableName, PrimaryKey: false, Nullable: true})
 		columns = append(columns, &sql.Column{Name: "dirty", Type: types.Boolean, Source: bt.tableName, PrimaryKey: false, Nullable: true})
 	}
+	columns = append(columns,
+		&sql.Column{Name: "latest_author", Type: types.Text, Source: bt.tableName, PrimaryKey: false, Nullable: true, DatabaseSource: bt.db.Name()},
+		&sql.Column{Name: "latest_author_email", Type: types.Text, Source: bt.tableName, PrimaryKey: false, Nullable: true, DatabaseSource: bt.db.Name()},
+		&sql.Column{Name: "latest_author_date", Type: types.Datetime3, Source: bt.tableName, PrimaryKey: false, Nullable: true, DatabaseSource: bt.db.Name()},
+	)
 	return columns
 }
 
@@ -398,7 +403,7 @@ func (itr *BranchItr) Next(ctx *sql.Context) (sql.Row, error) {
 
 		remoteBranches := itr.table.remote
 		if remoteBranches {
-			return sql.NewRow(name, h.String(), meta.Name, meta.Email, meta.Time(), meta.Description), nil
+			return sql.NewRow(name, h.String(), meta.Committer.Name, meta.Committer.Email, meta.Committer.Date.Time(), meta.Description, meta.Author.Name, meta.Author.Email, meta.Author.Date.Time()), nil
 		} else {
 			branches, err := itr.table.db.DbData().Rsr.GetBranches()
 			if err != nil {
@@ -412,7 +417,7 @@ func (itr *BranchItr) Next(ctx *sql.Context) (sql.Row, error) {
 				remoteName = branch.Remote
 				branchName = branch.Merge.Ref.GetPath()
 			}
-			return sql.NewRow(name, h.String(), meta.Name, meta.Email, meta.Time(), meta.Description, remoteName, branchName, dirty), nil
+			return sql.NewRow(name, h.String(), meta.Committer.Name, meta.Committer.Email, meta.Committer.Date.Time(), meta.Description, remoteName, branchName, dirty, meta.Author.Name, meta.Author.Email, meta.Author.Date.Time()), nil
 		}
 	}
 }

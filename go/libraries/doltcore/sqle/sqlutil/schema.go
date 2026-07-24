@@ -52,12 +52,17 @@ func ParseCreateTableStatement(ctx *sql.Context, root doltdb.RootValue, engine *
 		for _, c := range idx.Columns {
 			prefixes = append(prefixes, uint16(c.Length))
 		}
+		var predicateStr string
+		if idx.Predicate != nil {
+			predicateStr = idx.Predicate.String()
+		}
 		props := schema.IndexProperties{
 			IsUnique:   idx.IsUnique(),
 			IsSpatial:  idx.IsSpatial(),
 			IsFullText: idx.IsFullText(),
 			IsVector:   idx.IsVector(),
 			Comment:    idx.Comment,
+			Predicate:  predicateStr,
 		}
 		name := getIndexName(idx)
 		_, err = sch.Indexes().AddIndexByColNames(name, idx.ColumnNames(), prefixes, props)
@@ -68,8 +73,8 @@ func ParseCreateTableStatement(ctx *sql.Context, root doltdb.RootValue, engine *
 
 	// foreign keys are stored on the *doltdb.Table object, ignore them here
 	for _, chk := range create.Checks() {
-		name := getCheckConstraintName(chk)
-		_, err = sch.Checks().AddCheck(name, chk.Expr.String(), chk.Enforced)
+		name := getCheckConstraintName(ctx, chk)
+		_, err = sch.Checks().AddCheck(name, chk.Expr.String(), chk.Enforced, false)
 		if err != nil {
 			return "", nil, err
 		}
@@ -84,9 +89,9 @@ func getIndexName(def *sql.IndexDef) string {
 	return strings.Join(def.ColumnNames(), "_") + "_key"
 }
 
-func getCheckConstraintName(chk *sql.CheckConstraint) string {
+func getCheckConstraintName(ctx *sql.Context, chk *sql.CheckConstraint) string {
 	if chk.Name != "" {
 		return chk.Name
 	}
-	return chk.DebugString()
+	return chk.DebugString(ctx)
 }

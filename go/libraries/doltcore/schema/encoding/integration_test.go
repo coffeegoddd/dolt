@@ -49,7 +49,7 @@ func TestSchemaSerializationIntegration(t *testing.T) {
 
 func testSchemaSerializationNoms(t *testing.T, sch schema.Schema) {
 	ctx := context.Background()
-	nbf := types.Format_Default
+	nbf := types.Format_DOLT
 	vrw := getTestVRW(nbf)
 	v, err := encoding.MarshalSchema(ctx, vrw, sch)
 	require.NoError(t, err)
@@ -60,7 +60,7 @@ func testSchemaSerializationNoms(t *testing.T, sch schema.Schema) {
 
 func testSchemaSerializationFlatbuffers(t *testing.T, sch schema.Schema) {
 	ctx := context.Background()
-	nbf := types.Format_Default
+	nbf := types.Format_DOLT
 	vrw := getTestVRW(nbf)
 	v, err := encoding.SerializeSchema(ctx, vrw, sch)
 	require.NoError(t, err)
@@ -72,7 +72,7 @@ func testSchemaSerializationFlatbuffers(t *testing.T, sch schema.Schema) {
 func parseSchemaString(t *testing.T, s string) schema.Schema {
 	ctx := context.Background()
 	dEnv := dtestutils.CreateTestEnv()
-	defer dEnv.DoltDB(ctx).Close()
+	defer dEnv.Close()
 	root, err := dEnv.WorkingRoot(ctx)
 	require.NoError(t, err)
 	eng, db, err := engine.NewSqlEngineForEnv(ctx, dEnv)

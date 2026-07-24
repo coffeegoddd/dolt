@@ -22,6 +22,7 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/dolthub/dolt/go/libraries/doltcore/doltdb/durable"
+	"github.com/dolthub/dolt/go/libraries/doltcore/schema"
 	"github.com/dolthub/dolt/go/store/prolly"
 	"github.com/dolthub/dolt/go/store/prolly/tree"
 	"github.com/dolthub/dolt/go/store/val"
@@ -104,7 +105,7 @@ func (p prollyIndexIter) Next(ctx *sql.Context) (sql.Row, error) {
 		from := p.pkMap.MapOrdinal(to)
 		p.pkBld.PutRaw(to, idxKey.GetField(from))
 	}
-	pk, err := p.pkBld.Build(sharePool)
+	pk, err := p.pkBld.Build(ctx, sharePool)
 	if err != nil {
 		return nil, err
 	}
@@ -129,7 +130,7 @@ func (p prollyIndexIter) NextValueRow(ctx *sql.Context) (sql.ValueRow, error) {
 		from := p.pkMap.MapOrdinal(to)
 		p.pkBld.PutRaw(to, idxKey.GetField(from))
 	}
-	pk, err := p.pkBld.Build(sharePool)
+	pk, err := p.pkBld.Build(ctx, sharePool)
 	if err != nil {
 		return nil, err
 	}
@@ -203,23 +204,7 @@ func (p prollyIndexIter) Close(*sql.Context) error {
 
 func OrdinalMappingFromIndex(idx DoltIndex) (m val.OrdinalMapping) {
 	def := idx.Schema().Indexes().GetByName(idx.ID())
-	pks := def.PrimaryKeyTags()
-	if len(pks) == 0 { // keyless index
-		m = make(val.OrdinalMapping, 1)
-		m[0] = len(def.AllTags())
-		return m
-	}
-
-	m = make(val.OrdinalMapping, len(pks))
-	for i, pk := range pks {
-		for j, tag := range def.AllTags() {
-			if tag == pk {
-				m[i] = j
-				break
-			}
-		}
-	}
-	return
+	return schema.PrimaryIndexOrdinalToSecondaryIndexOrdinal(def)
 }
 
 type prollyCoveringIndexIter struct {
@@ -482,7 +467,7 @@ func (p prollyKeylessIndexIter) queueRows(ctx context.Context) error {
 			from := p.clusteredMap.MapOrdinal(to)
 			p.clusteredBld.PutRaw(to, idxKey.GetField(from))
 		}
-		pk, err := p.clusteredBld.Build(sharePool)
+		pk, err := p.clusteredBld.Build(ctx, sharePool)
 		if err != nil {
 			return err
 		}

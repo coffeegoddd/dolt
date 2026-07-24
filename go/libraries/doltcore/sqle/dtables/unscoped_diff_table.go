@@ -63,7 +63,7 @@ func NewUnscopedDiffTable(_ *sql.Context, dbName, tableName string, ddb *doltdb.
 }
 
 func (dt *UnscopedDiffTable) DataLength(ctx *sql.Context) (uint64, error) {
-	numBytesPerRow := schema.SchemaAvgLength(dt.Schema())
+	numBytesPerRow := schema.SchemaAvgLength(dt.Schema(ctx))
 	numRows, _, err := dt.RowCount(ctx)
 	if err != nil {
 		return 0, err
@@ -95,6 +95,9 @@ func getUnscopedDoltDiffSchema(dbName, tableName string) sql.Schema {
 		{Name: "message", Type: types.Text, Source: tableName, PrimaryKey: false, DatabaseSource: dbName},
 		{Name: "data_change", Type: types.Boolean, Source: tableName, PrimaryKey: false, DatabaseSource: dbName},
 		{Name: "schema_change", Type: types.Boolean, Source: tableName, PrimaryKey: false, DatabaseSource: dbName},
+		{Name: "author", Type: types.Text, Source: tableName, PrimaryKey: false, DatabaseSource: dbName},
+		{Name: "author_email", Type: types.Text, Source: tableName, PrimaryKey: false, DatabaseSource: dbName},
+		{Name: "author_date", Type: types.DatetimeMaxPrecision, Source: tableName, PrimaryKey: false, DatabaseSource: dbName},
 	}
 }
 
@@ -103,7 +106,7 @@ func getUnscopedDoltDiffSchema(dbName, tableName string) sql.Schema {
 var GetUnscopedDoltDiffSchema = getUnscopedDoltDiffSchema
 
 // Schema is a sql.Table interface function that returns the sql.Schema for this system table.
-func (dt *UnscopedDiffTable) Schema() sql.Schema {
+func (dt *UnscopedDiffTable) Schema(ctx *sql.Context) sql.Schema {
 	return GetUnscopedDoltDiffSchema(dt.dbName, dt.tableName)
 }
 
@@ -165,7 +168,7 @@ func (dt *UnscopedDiffTable) LookupPartitions(ctx *sql.Context, lookup sql.Index
 	if lookup.Index.ID() == index.CommitHashIndexId {
 		hs, ok := index.LookupToPointSelectStr(lookup)
 		if !ok {
-			return nil, fmt.Errorf("failed to parse commit lookup ranges: %s", sql.DebugString(lookup.Ranges))
+			return nil, fmt.Errorf("failed to parse commit lookup ranges: %s", sql.DebugString(ctx, lookup.Ranges))
 		}
 		hashes, commits, metas := index.HashesToCommits(ctx, dt.ddb, hs, dt.head, false)
 		if len(hashes) == 0 {
@@ -278,6 +281,9 @@ func (d *doltDiffWorkingSetRowItr) Next(ctx *sql.Context) (sql.Row, error) {
 			nil, // message
 			change.DataChange,
 			change.SchemaChange,
+			nil, // author
+			nil, // author_email
+			nil, // author_date
 		)
 
 		return sqlRow, nil
@@ -395,12 +401,15 @@ func (itr *doltDiffCommitHistoryRowItr) Next(ctx *sql.Context) (sql.Row, error) 
 	return sql.NewRow(
 		h.String(),
 		tableChange.TableName.String(),
-		meta.Name,
-		meta.Email,
-		meta.Time(),
+		meta.Committer.Name,
+		meta.Committer.Email,
+		meta.Committer.Date.Time(),
 		meta.Description,
 		tableChange.DataChange,
 		tableChange.SchemaChange,
+		meta.Author.Name,
+		meta.Author.Email,
+		meta.Author.Date.Time(),
 	), nil
 }
 

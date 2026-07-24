@@ -1,4 +1,4 @@
-// Copyright 2020 Dolthub, Inc.
+// Copyright 2026 Dolthub, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,23 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package types
+//go:build windows
+
+package gitauth
 
 import (
-	"testing"
+	"os/exec"
+	"syscall"
 
-	"github.com/shopspring/decimal"
-	"github.com/stretchr/testify/require"
+	"golang.org/x/sys/windows"
 )
 
-func TestDecimalLibraryEncoding(t *testing.T) {
-	expectedBytes := []byte{255, 255, 255, 250, 3, 25, 222, 110, 95, 84, 132}
-	dec := decimal.RequireFromString("-28443125.175428")
-	bytes, err := dec.GobEncode()
-	require.NoError(t, err)
-	require.Equal(t, expectedBytes, bytes)
-	expectedDec := decimal.Decimal{}
-	err = expectedDec.GobDecode(expectedBytes)
-	require.NoError(t, err)
-	require.True(t, expectedDec.Equal(dec))
+// CmdSetsid detaches |cmd| from the parent console (DETACHED_PROCESS).
+// SSH needs CONIN$ to prompt for credentials; without a console it exits with an auth error.
+func CmdSetsid(cmd *exec.Cmd) {
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		CreationFlags: windows.DETACHED_PROCESS,
+	}
 }

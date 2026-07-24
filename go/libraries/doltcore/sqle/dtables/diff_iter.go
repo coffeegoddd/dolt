@@ -26,16 +26,8 @@ import (
 	"github.com/dolthub/dolt/go/libraries/doltcore/schema"
 	"github.com/dolthub/dolt/go/store/prolly"
 	"github.com/dolthub/dolt/go/store/prolly/tree"
-	"github.com/dolthub/dolt/go/store/types"
 	"github.com/dolthub/dolt/go/store/val"
 )
-
-type commitInfo struct {
-	date    *types.Timestamp
-	name    types.String
-	nameTag uint64
-	dateTag uint64
-}
 
 type commitInfo2 struct {
 	ts   *time.Time
@@ -131,12 +123,12 @@ func newProllyDiffIter(ctx *sql.Context, dp DiffPartition, targetFromSchema, tar
 		nodeStore = dp.from.NodeStore()
 	}
 
-	fromConverter, err := NewProllyRowConverter(fsch, targetFromSchema, ctx.Warn, nodeStore)
+	fromConverter, err := NewProllyRowConverter(ctx, fsch, targetFromSchema, ctx.Warn, nodeStore)
 	if err != nil {
 		return prollyDiffIter{}, err
 	}
 
-	toConverter, err := NewProllyRowConverter(tsch, targetToSchema, ctx.Warn, nodeStore)
+	toConverter, err := NewProllyRowConverter(ctx, tsch, targetToSchema, ctx.Warn, nodeStore)
 	if err != nil {
 		return prollyDiffIter{}, err
 	}
@@ -242,7 +234,15 @@ func (itr prollyDiffIter) queueRows(ctx context.Context) {
 	for _, rng := range itr.ranges {
 		var err error
 		// if the filter can match all NILs, then we need to return every added/removed diff
-		if rng.Matches(ctx, val.EmptyTuple) {
+		matches, mErr := rng.Matches(ctx, val.EmptyTuple)
+		if mErr != nil {
+			select {
+			case <-ctx.Done():
+			case itr.errChan <- mErr:
+			}
+			return
+		}
+		if matches {
 			err = prolly.DiffMaps(ctx, itr.from, itr.to, false, cb)
 		} else {
 			err = prolly.RangeDiffMaps(ctx, itr.from, itr.to, rng, cb)

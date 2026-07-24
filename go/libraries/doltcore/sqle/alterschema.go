@@ -259,6 +259,7 @@ func replaceColumnInSchema(sch schema.Schema, oldCol schema.Column, newCol schem
 				IsVector:           index.IsVector(),
 				IsUserDefined:      index.IsUserDefined(),
 				Comment:            index.Comment(),
+				Predicate:          index.Predicate(),
 				FullTextProperties: index.FullTextProperties(),
 				VectorProperties:   index.VectorProperties(),
 			})
@@ -269,7 +270,7 @@ func replaceColumnInSchema(sch schema.Schema, oldCol schema.Column, newCol schem
 
 	// Copy over all checks from the old schema
 	for _, check := range sch.Checks().AllChecks() {
-		_, err := newSch.Checks().AddCheck(check.Name(), check.Expression(), check.Enforced())
+		_, err := newSch.Checks().AddCheck(check.Name(), check.Expression(), check.Enforced(), check.IsNotValid())
 		if err != nil {
 			return nil, err
 		}
@@ -277,6 +278,9 @@ func replaceColumnInSchema(sch schema.Schema, oldCol schema.Column, newCol schem
 
 	// Copy over the collation
 	newSch.SetCollation(sch.GetCollation())
+
+	// Copy over target row size
+	newSch.SetTargetRowSize(sch.GetTargetRowSize())
 
 	pkOrds, err := modifyPkOrdinals(sch, newSch)
 	if err != nil {
@@ -356,7 +360,12 @@ func backupFkcIndexesForPkDrop(ctx *sql.Context, tbl string, sch schema.Schema, 
 			return nil, sql.ErrCantDropIndex.New("PRIMARY", fk.Name)
 		}
 
-		fkUpdates = append(fkUpdates, doltdb.FkIndexUpdate{FkName: fk.Name, FromIdx: fk.ReferencedTableIndex, ToIdx: newIdx.Name()})
+		fkUpdates = append(fkUpdates, doltdb.FkIndexUpdate{
+			FkName:  fk.Name,
+			Table:   fk.TableName,
+			FromIdx: fk.ReferencedTableIndex,
+			ToIdx:   newIdx.Name(),
+		})
 	}
 	return fkUpdates, nil
 }

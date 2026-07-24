@@ -58,6 +58,7 @@ type CommitDiffTable struct {
 var _ sql.Table = (*CommitDiffTable)(nil)
 var _ sql.IndexAddressable = (*CommitDiffTable)(nil)
 var _ sql.StatisticsTable = (*CommitDiffTable)(nil)
+var _ sql.IndexedTable = (*CommitDiffTable)(nil)
 
 func NewCommitDiffTable(ctx *sql.Context, dbName string, tblName doltdb.TableName, ddb *doltdb.DoltDB, wRoot, sRoot doltdb.RootValue, headRef ref.DoltRef) (sql.Table, error) {
 	diffTblName := doltdb.DoltCommitDiffTablePrefix + tblName.Name
@@ -79,7 +80,7 @@ func NewCommitDiffTable(ctx *sql.Context, dbName string, tblName doltdb.TableNam
 		return nil, err
 	}
 
-	sqlSch, err := sqlutil.FromDoltSchema(dbName, diffTblName, diffTableSchema)
+	sqlSch, err := sqlutil.FromDoltSchema(ctx, dbName, diffTblName, diffTableSchema)
 	if err != nil {
 		return nil, err
 	}
@@ -98,7 +99,7 @@ func NewCommitDiffTable(ctx *sql.Context, dbName string, tblName doltdb.TableNam
 }
 
 func (dt *CommitDiffTable) DataLength(ctx *sql.Context) (uint64, error) {
-	numBytesPerRow := schema.SchemaAvgLength(dt.Schema())
+	numBytesPerRow := schema.SchemaAvgLength(dt.Schema(ctx))
 	numRows, _, err := dt.RowCount(ctx)
 	if err != nil {
 		return 0, err
@@ -118,7 +119,7 @@ func (dt *CommitDiffTable) String() string {
 	return doltdb.DoltCommitDiffTablePrefix + dt.tableName.Name
 }
 
-func (dt *CommitDiffTable) Schema() sql.Schema {
+func (dt *CommitDiffTable) Schema(ctx *sql.Context) sql.Schema {
 	return dt.sqlSch.Schema
 }
 
@@ -133,7 +134,7 @@ func (dt *CommitDiffTable) GetIndexes(ctx *sql.Context) ([]sql.Index, error) {
 	if err != nil {
 		return nil, err
 	}
-	return index.DoltToFromCommitIndexes(dt.tableName.Name, sch), nil
+	return index.MakeDiffTableIndexes(doltdb.DoltCommitDiffTablePrefix+dt.tableName.Name, sch, sch, dt.table.NodeStore(), true), nil
 }
 
 // IndexedAccess implements sql.IndexAddressable
@@ -308,7 +309,7 @@ func (dt *CommitDiffTable) rootValForHash(ctx *sql.Context, hashStr string) (dol
 			return nil, "", nil, err
 		}
 
-		t := meta.Time()
+		t := meta.Committer.Date.Time()
 		commitTime = (*types.Timestamp)(&t)
 	}
 

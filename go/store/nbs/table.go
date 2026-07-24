@@ -277,6 +277,9 @@ type chunkSource interface {
 	// the scan, and will likely mean that the scan didn't complete. Note that errors returned by this method are not
 	// related to the callback - if the callback discovers an error, it must manage that out of band.
 	iterateAllChunks(context.Context, func(chunk chunks.Chunk), *Stats) error
+
+	// tolerantIterateAllChunks is for [TolerantChunkIterator.TolerantIterateAllChunks]
+	tolerantIterateAllChunks(context.Context, func(chunk chunks.Chunk), func(err error), *Stats)
 }
 
 type chunkSources []chunkSource
@@ -295,4 +298,24 @@ func (css chunkSourceSet) close() {
 	for _, cs := range css {
 		cs.close()
 	}
+}
+
+func (css *chunkSourceSet) hasMany(_ context.Context, hashes hash.HashSet) (hash.HashSet, error) {
+	records := toHasRecords(hashes)
+	for _, src := range *css {
+		remaining, _, err := src.hasMany(records, nil)
+		if err != nil {
+			return nil, err
+		}
+		if !remaining {
+			break
+		}
+	}
+	absent := hash.HashSet{}
+	for _, r := range records {
+		if !r.has {
+			absent.Insert(*r.a)
+		}
+	}
+	return absent, nil
 }

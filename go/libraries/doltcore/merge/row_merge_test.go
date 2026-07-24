@@ -15,6 +15,7 @@
 package merge
 
 import (
+	"context"
 	"strconv"
 	"testing"
 
@@ -164,7 +165,7 @@ func TestRowMerge(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			v := NewValueMerger(test.mergedSch, test.leftSch, test.rightSch, test.baseSch, syncPool, nil)
+			v := NewValueMerger(ctx, test.mergedSch, test.leftSch, test.rightSch, test.baseSch, syncPool, nil)
 
 			merged, ok, err := v.TryMerge(ctx, test.row, test.mergeRow, test.ancRow)
 			assert.NoError(t, err)
@@ -232,7 +233,7 @@ func buildTup(sch schema.Schema, r []*int) val.Tuple {
 			vB.PutInt64(i, int64(*v))
 		}
 	}
-	tup, err := vB.Build(syncPool)
+	tup, err := vB.Build(context.Background(), syncPool)
 	if err != nil {
 		panic(err)
 	}

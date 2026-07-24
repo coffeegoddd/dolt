@@ -53,6 +53,7 @@ import (
 	"github.com/dolthub/dolt/go/libraries/doltcore/dconfig"
 	"github.com/dolthub/dolt/go/libraries/doltcore/doltdb"
 	"github.com/dolthub/dolt/go/libraries/doltcore/env"
+	"github.com/dolthub/dolt/go/libraries/doltcore/memlimit"
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/dfunctions"
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/dsess"
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/dtables"
@@ -61,7 +62,6 @@ import (
 	"github.com/dolthub/dolt/go/libraries/utils/config"
 	"github.com/dolthub/dolt/go/libraries/utils/dynassert"
 	"github.com/dolthub/dolt/go/libraries/utils/filesys"
-	"github.com/dolthub/dolt/go/libraries/utils/gitauth"
 	"github.com/dolthub/dolt/go/store/nbs"
 	"github.com/dolthub/dolt/go/store/util/tempfiles"
 )
@@ -87,9 +87,9 @@ var commandsWithoutCliCtx = []cli.Command{
 	docscmds.Commands,
 	&commands.Assist{},
 	commands.ProfileCmd{},
-	commands.ArchiveCmd{},
 	commands.FsckCmd{},
 	commands.ConfigCmd{},
+	commands.InitCmd{},
 }
 
 var commandsWithoutGlobalArgSupport = []cli.Command{
@@ -120,6 +120,7 @@ var commandsWithoutCurrentDirWrites = []cli.Command{
 // on terms that make sense for their purpose.
 var commandsSkippingDBLoad = []cli.Command{
 	commands.FsckCmd{},
+	commands.InitCmd{},
 }
 
 // commands that use stdio directly and must not have it redirected.
@@ -229,10 +230,6 @@ func runMain() int {
 	args := os.Args[1:]
 
 	start := time.Now()
-
-	// Dolt must never block on interactive git credential prompts. Enforce a
-	// non-interactive git policy for the entire process (CLI + sql-server).
-	gitauth.DisableInteractivePrompts()
 
 	if len(args) == 0 {
 		doltCommand.PrintUsage("dolt")
@@ -448,13 +445,15 @@ func runMain() int {
 
 	warnIfMaxFilesTooLow()
 
+	// Initialize memory budget from GOMEMLIMIT before any DB loading.
+	memlimit.Init()
+
 	if ok, exit := interceptSendMetrics(ctx, cfg.remainingArgs); ok {
 		return exit
 	}
 
 	// This is the dEnv passed to sub-commands, and is used to create the multi-repo environment.
 	dEnv := env.LoadWithoutDB(ctx, env.GetCurrentUserHomeDir, cfg.dataDirFS, doltdb.LocalDirDoltDB, doltversion.Version)
-
 	if dEnv.CfgLoadErr != nil {
 		cli.PrintErrln(color.RedString("Failed to load the global config. %v", dEnv.CfgLoadErr))
 		return 1
@@ -512,7 +511,7 @@ func runMain() int {
 	// part of Dolt config in the first place!).
 	var mrEnv *env.MultiRepoEnv
 	if needsDBLoad(cfg.subCommand) {
-		mrEnv, err = env.MultiEnvForDirectory(ctx, dEnv.Config.WriteableConfig(), cfg.dataDirFS, dEnv.Version, dEnv)
+		mrEnv, err = env.MultiEnvForDirectory(ctx, cfg.dataDirFS, dEnv)
 		if err != nil {
 			cli.PrintErrln("failed to load database names:", err.Error())
 			return 1
@@ -552,7 +551,10 @@ func runMain() int {
 			return 1
 		}
 	} else {
-		if cfg.hasGlobalArgs {
+		// This is a kludge, like a lot of the of the control flow in this file.
+		// `init` is just going to work on the root dEnv we passed, so it does
+		// support --data-dir.
+		if cfg.hasGlobalArgs && cfg.subCommand != "init" {
 			if supportsGlobalArgs(cfg.subCommand) {
 				cli.PrintErrln(
 					`Global arguments are not supported for this command as it has not yet been migrated to function in a remote context. 
@@ -667,7 +669,9 @@ If you're interested in running this command against a remote host, hit us up on
 		if apr.Contains(cli.NoTLSFlag) {
 			tlsMode = sqlserver.QueryistTLSMode_Disabled
 		}
-		return sqlserver.BuildConnectionStringQueryist(ctx, cwdFS, creds, apr, host, port, tlsMode, useDb)
+		doltConfigName := rootEnv.Config.GetStringOrDefault(config.UserNameKey, env.DefaultName)
+		doltConfigEmail := rootEnv.Config.GetStringOrDefault(config.UserEmailKey, env.DefaultEmail)
+		return sqlserver.BuildConnectionStringQueryist(ctx, cwdFS, creds, apr, host, port, tlsMode, useDb, doltConfigName, doltConfigEmail)
 	} else {
 		_, hasPort := apr.GetInt(cli.PortFlag)
 		if hasPort {
@@ -748,10 +752,21 @@ If you're interested in running this command against a remote host, hit us up on
 		// repositories in our MultiEnv are ReadOnly. This includes the
 		// case where there are no repositories in our MultiEnv
 		var allReposAreReadOnly bool = true
+		var anyIsReadOnly bool = false
 		err = mrEnv.Iter(func(name string, dEnv *env.DoltEnv) (stop bool, err error) {
+			if anyIsReadOnly {
+				if dEnv.DBLoadParams == nil {
+					dEnv.DBLoadParams = map[string]any{dbfactory.SkipJournalLockTimeoutParam: true}
+				} else {
+					dEnv.DBLoadParams[dbfactory.SkipJournalLockTimeoutParam] = true
+				}
+			}
 			readOnly, err := dEnv.IsAccessModeReadOnly(ctx)
 			if err != nil {
 				return true, fmt.Errorf("Failed to load database %s due to error: %w", name, err)
+			}
+			if readOnly {
+				anyIsReadOnly = true
 			}
 
 			allReposAreReadOnly = allReposAreReadOnly && readOnly
@@ -778,7 +793,9 @@ If you're interested in running this command against a remote host, hit us up on
 			if !creds.Specified {
 				creds = &cli.UserPassword{Username: sqlserver.LocalConnectionUser, Password: localCreds.Secret, Specified: false}
 			}
-			return sqlserver.BuildConnectionStringQueryist(ctx, cwdFS, creds, apr, "localhost", localCreds.Port, sqlserver.QueryistTLSMode_NoVerify_FallbackToPlaintext, useDb)
+			doltConfigName := targetEnv.Config.GetStringOrDefault(config.UserNameKey, env.DefaultName)
+			doltConfigEmail := targetEnv.Config.GetStringOrDefault(config.UserEmailKey, env.DefaultEmail)
+			return sqlserver.BuildConnectionStringQueryist(ctx, cwdFS, creds, apr, "localhost", localCreds.Port, sqlserver.QueryistTLSMode_NoVerify_FallbackToPlaintext, useDb, doltConfigName, doltConfigEmail)
 		}
 	}
 

@@ -297,7 +297,7 @@ func (d *DoltHarness) NewEngine(t *testing.T) (enginetest.QueryEngine, error) {
 			}
 
 			// Get a fresh session after running setup scripts, since some setup scripts can change the session state
-			d.session, err = dsess.NewDoltSession(enginetest.NewBaseSession(), d.provider, d.multiRepoEnv.Config(), d.branchControl, d.statsPro, writer.NewWriteSession, nil, d.branchActivityTracker)
+			d.session, err = dsess.NewDoltSession(enginetest.NewBaseSession(), d.provider, d.multiRepoEnv.Config(), d.branchControl, d.statsPro, writer.NewWriteSession, d.gcSafepointController, d.branchActivityTracker)
 			require.NoError(t, err)
 		}
 
@@ -429,7 +429,7 @@ func (d *DoltHarness) newSessionWithClient(client sql.Client) *dsess.DoltSession
 	localConfig := d.multiRepoEnv.Config()
 	pro := d.session.Provider()
 
-	dSession, err := dsess.NewDoltSession(sql.NewBaseSessionWithClientServer("address", client, 1), pro.(dsess.DoltDatabaseProvider), localConfig, d.branchControl, d.statsPro, writer.NewWriteSession, nil, d.branchActivityTracker)
+	dSession, err := dsess.NewDoltSession(sql.NewBaseSessionWithClientServer("address", client, 1), pro.(dsess.DoltDatabaseProvider), localConfig, d.branchControl, d.statsPro, writer.NewWriteSession, d.gcSafepointController, d.branchActivityTracker)
 	dSession.SetCurrentDatabase("mydb")
 	require.NoError(d.t, err)
 	return dSession
@@ -560,12 +560,12 @@ func (d *DoltHarness) newProvider(ctx context.Context) sql.MutableDatabaseProvid
 	} else {
 		dEnv = dtestutils.CreateTestEnv()
 	}
-	defer dEnv.DoltDB(ctx).Close()
+	defer dEnv.Close()
 
 	store := dEnv.DoltDB(ctx).ValueReadWriter().(*types.ValueStore)
 	store.SetValidateContentAddresses(true)
 
-	mrEnv, err := env.MultiEnvForDirectory(context.Background(), dEnv.Config.WriteableConfig(), dEnv.FS, dEnv.Version, dEnv)
+	mrEnv, err := env.MultiEnvForDirectory(context.Background(), dEnv.FS, dEnv)
 	require.NoError(d.t, err)
 	d.multiRepoEnv = mrEnv
 

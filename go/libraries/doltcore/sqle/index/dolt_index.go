@@ -24,11 +24,14 @@ import (
 	"github.com/dolthub/go-mysql-server/sql/expression"
 	"github.com/dolthub/go-mysql-server/sql/expression/function/vector"
 	"github.com/dolthub/go-mysql-server/sql/fulltext"
+	"github.com/dolthub/go-mysql-server/sql/sets"
 	sqltypes "github.com/dolthub/go-mysql-server/sql/types"
+	vttypes "github.com/dolthub/vitess/go/sqltypes"
 
 	"github.com/dolthub/dolt/go/libraries/doltcore/doltdb"
 	"github.com/dolthub/dolt/go/libraries/doltcore/doltdb/durable"
 	"github.com/dolthub/dolt/go/libraries/doltcore/schema"
+	"github.com/dolthub/dolt/go/libraries/doltcore/schema/typeinfo"
 	"github.com/dolthub/dolt/go/store/datas"
 	"github.com/dolthub/dolt/go/store/hash"
 	"github.com/dolthub/dolt/go/store/pool"
@@ -69,16 +72,16 @@ type BranchNameIndex struct {
 	*doltIndex
 }
 
-func (bni *BranchNameIndex) ExtendedExpressions() []string {
+func (bni *BranchNameIndex) ExtendedExpressions(ctx *sql.Context) []string {
 	// The MockIndex used by the branch name virtual index doesn't set an index schema, so
 	// we can't use the implementation of ExtendedExpressions from doltIndex.
 	return bni.Expressions()
 }
 
-func (bni *BranchNameIndex) ExtendedColumnExpressionTypes() []sql.ColumnExpressionType {
+func (bni *BranchNameIndex) ExtendedColumnExpressionTypes(ctx *sql.Context) []sql.ColumnExpressionType {
 	// The MockIndex used by the branch name virtual index doesn't set an index schema, so
 	// we can't use the implementation of ExtendedColumnExpressionTypes from doltIndex.
-	return bni.ColumnExpressionTypes()
+	return bni.ColumnExpressionTypes(ctx)
 }
 
 func NewCommitIndex(i *doltIndex) *CommitIndex {
@@ -182,9 +185,10 @@ func DoltDiffIndexesFromTable(ctx context.Context, db, tbl string, t *doltdb.Tab
 		columns: []schema.Column{
 			schema.NewColumn(ToCommitIndexId, schema.DiffCommitTag, types.StringKind, false),
 		},
-		indexSch:                      sch,
-		tableSch:                      sch,
-		unique:                        true,
+		indexSch: sch,
+		tableSch: sch,
+		// A single commit changes many rows, so the to_commit and from_commit indexes are not unique.
+		unique:                        false,
 		comment:                       "",
 		vrw:                           t.ValueReadWriter(),
 		ns:                            t.NodeStore(),
@@ -200,7 +204,7 @@ func DoltDiffIndexesFromTable(ctx context.Context, db, tbl string, t *doltdb.Tab
 			},
 			indexSch:                      sch,
 			tableSch:                      sch,
-			unique:                        true,
+			unique:                        false,
 			comment:                       "",
 			vrw:                           t.ValueReadWriter(),
 			ns:                            t.NodeStore(),
@@ -211,32 +215,103 @@ func DoltDiffIndexesFromTable(ctx context.Context, db, tbl string, t *doltdb.Tab
 	return indexes, nil
 }
 
-func DoltToFromCommitIndexes(tbl string, sch schema.Schema) (indexes []sql.Index) {
-	for _, toFrom := range []string{"to", "from"} {
-		cols := make([]schema.Column, 0, len(sch.GetAllCols().GetColumns())+2)
+func MakeDiffTableIndex(tableName string, prefix string, sch schema.Schema, includeCommitColumns bool, vs val.ValueStore) *doltIndex {
+	cols := make([]schema.Column, 0, len(sch.GetAllCols().GetColumns())+2)
+	if includeCommitColumns {
 		cols = append(cols,
 			schema.NewColumn(ToCommitIndexId, schema.DiffCommitTag, types.StringKind, false),
 			schema.NewColumn(FromCommitIndexId, schema.DiffCommitTag, types.StringKind, false),
 		)
-		for _, col := range sch.GetPKCols().GetColumns() {
-			col.Name = toFrom + "_" + col.Name
-			cols = append(cols, col)
-		}
+	}
+	for _, col := range sch.GetPKCols().GetColumns() {
+		col.Name = prefix + "_" + col.Name
+		cols = append(cols, col)
+	}
 
-		indexes = append(indexes, &doltIndex{
-			id:                            "commits_" + toFrom,
-			tblName:                       doltdb.DoltCommitDiffTablePrefix + tbl,
-			columns:                       cols,
-			unique:                        true,
-			comment:                       "",
-			order:                         sql.IndexOrderNone,
-			constrainedToLookupExpression: false,
-			// We pass a nil ValueStore into the key builder, because we don't have one. This would cause an issue
-			// if any of the columns use Adaptive encoding, but that shouldn't be possible in the primary key.
-			keyBld: val.NewTupleBuilder(sch.GetKeyDescriptor(nil), nil),
-		})
+	return &doltIndex{
+		id:                            "commits_" + prefix,
+		tblName:                       tableName,
+		columns:                       cols,
+		unique:                        true,
+		comment:                       "",
+		order:                         sql.IndexOrderNone,
+		constrainedToLookupExpression: false,
+		// We pass a nil ValueStore into the key builder, because we don't have one. This would cause an issue
+		// if any of the columns use Adaptive encoding, but that shouldn't be possible in the primary key.
+		keyBld: val.NewTupleBuilder(sch.GetKeyDescriptor(nil), vs),
+	}
+}
+
+func MakeDiffTableIndexes(tbl string, toSchema, fromSchema schema.Schema, vs val.ValueStore, includeCommits bool) (indexes []sql.Index) {
+	indexes = make([]sql.Index, 0)
+	if toSchema != nil {
+		indexes = append(indexes, MakeDiffTableIndex(tbl, "to", toSchema, includeCommits, vs))
+	}
+	if fromSchema != nil {
+		indexes = append(indexes, MakeDiffTableIndex(tbl, "from", fromSchema, includeCommits, vs))
 	}
 	return indexes
+}
+
+// SecondaryDiffIndexType indicates a type of index on DOLT_DIFF.
+// DOLT_DIFF tables can be indexed on columns from the "to_" side of the diff, or the "from_" side.
+type SecondaryDiffIndexType int
+
+const (
+	SecondaryDiffIndexType_To SecondaryDiffIndexType = iota
+	SecondaryDiffIndexType_From
+)
+
+// Indexes on DOLT_DIFF are named after the index on the underlying table, prefixed by whether the "to" or "from" table
+// is having its columns selected on.
+func (t SecondaryDiffIndexType) Prefix() string {
+	switch t {
+	case SecondaryDiffIndexType_To:
+		return "to"
+	case SecondaryDiffIndexType_From:
+		return "from"
+	default:
+		panic("unknown secondary diff index type")
+	}
+}
+
+// MakeDiffTableSecondaryIndex creates a *doltIndex for a secondary index on the diff table function.
+// The prefix should be "to" or "from" and determines the column name prefix (e.g., "to_c1").
+// Returns nil, nil for fulltext, spatial, or vector indexes which are not supported.
+func MakeDiffTableSecondaryIndex(ctx context.Context, tableName string, indexType SecondaryDiffIndexType, t *doltdb.Table, sch schema.Schema, idx schema.Index) (*doltIndex, error) {
+	if idx.IsFullText() || idx.IsSpatial() || idx.IsVector() {
+		return nil, nil
+	}
+
+	indexRows, err := t.GetIndexRowData(ctx, idx.Name())
+	if err != nil {
+		return nil, err
+	}
+	keyBld := keyBuilderForIndex(indexRows)
+
+	cols := make([]schema.Column, idx.Count())
+	for i, tag := range idx.IndexedColumnTags() {
+		col, _ := idx.GetColumn(tag)
+		col.Name = indexType.Prefix() + "_" + col.Name
+		cols[i] = col
+	}
+
+	return &doltIndex{
+		id:                            indexType.Prefix() + "_" + idx.Name(),
+		tblName:                       tableName,
+		columns:                       cols,
+		indexSch:                      idx.Schema(),
+		tableSch:                      sch,
+		unique:                        idx.IsUnique(),
+		isPk:                          false,
+		comment:                       idx.Comment(),
+		vrw:                           t.ValueReadWriter(),
+		ns:                            t.NodeStore(),
+		keyBld:                        keyBld,
+		order:                         sql.IndexOrderNone,
+		constrainedToLookupExpression: false,
+		prefixLengths:                 idx.PrefixLengths(),
+	}, nil
 }
 
 // MockIndex returns a sql.Index that is not backed by an actual datastore. It's useful for system tables and
@@ -421,6 +496,7 @@ func getSecondaryIndex(ctx context.Context, db, tbl string, t *doltdb.Table, sch
 		vector:                        idx.IsVector(),
 		isPk:                          false,
 		comment:                       idx.Comment(),
+		predicate:                     idx.Predicate(),
 		vrw:                           vrw,
 		ns:                            t.NodeStore(),
 		keyBld:                        keyBld,
@@ -453,6 +529,7 @@ func ConvertFullTextToSql(ctx context.Context, db, tbl string, sch schema.Schema
 		vector:                        idx.IsVector(),
 		isPk:                          false,
 		comment:                       idx.Comment(),
+		predicate:                     idx.Predicate(),
 		vrw:                           nil,
 		ns:                            nil,
 		keyBld:                        nil,
@@ -527,10 +604,11 @@ type doltIndex struct {
 	tableSch    schema.Schema
 	vectorProps schema.VectorProperties
 
-	id      string
-	dbName  string
-	tblName string
-	comment string
+	id        string
+	dbName    string
+	tblName   string
+	comment   string
+	predicate string
 
 	fullTextProps schema.FullTextProperties
 	prefixLengths []uint16
@@ -552,15 +630,21 @@ type doltIndex struct {
 type LookupMeta struct {
 	Idx      sql.Index
 	Fds      *sql.FuncDepSet
-	Cols     sql.FastIntSet
+	Cols     sets.FastIntSet
 	Ordinals []int
 }
 
-func GetStrictLookups(schCols *schema.ColCollection, indexes []sql.Index) []LookupMeta {
+// GetStrictLookups searches |indexes| and returns a slice of LookupMeta that indicates which indexes can be used
+// for strict lookups. Indexes may be used for strict lookups if they are a unique index and the columns they
+// cover are not nullable.
+func GetStrictLookups(ctx *sql.Context, schCols *schema.ColCollection, indexes []sql.Index) []LookupMeta {
 	var lookups []LookupMeta
 	for _, i := range indexes {
 		idx := i.(*doltIndex)
 		if !idx.IsUnique() {
+			continue
+		}
+		if idx.predicate != "" {
 			continue
 		}
 		var nullAccepting bool
@@ -574,7 +658,7 @@ func GetStrictLookups(schCols *schema.ColCollection, indexes []sql.Index) []Look
 			continue
 		}
 		var ordinals []int
-		allCols := sql.NewFastIntSet()
+		allCols := sets.NewFastIntSet()
 		for _, c := range idx.columns {
 			idx := schCols.TagToIdx[c.Tag]
 			allCols.Add(idx + 1)
@@ -608,7 +692,7 @@ func (di *doltIndex) CanSupportOrderBy(expr sql.Expression) bool {
 }
 
 // ColumnExpressionTypes implements the interface sql.Index.
-func (di *doltIndex) ColumnExpressionTypes() []sql.ColumnExpressionType {
+func (di *doltIndex) ColumnExpressionTypes(ctx *sql.Context) []sql.ColumnExpressionType {
 	if di.colExprTypes == nil {
 		di.colExprTypes = make([]sql.ColumnExpressionType, len(di.columns))
 		for i, col := range di.columns {
@@ -622,7 +706,7 @@ func (di *doltIndex) ColumnExpressionTypes() []sql.ColumnExpressionType {
 }
 
 // ExtendedColumnExpressionTypes implements the interface sql.ExtendedIndex.
-func (di *doltIndex) ExtendedColumnExpressionTypes() []sql.ColumnExpressionType {
+func (di *doltIndex) ExtendedColumnExpressionTypes(ctx *sql.Context) []sql.ColumnExpressionType {
 	pkCols := di.indexSch.GetPKCols()
 	cets := make([]sql.ColumnExpressionType, 0, len(pkCols.Tags))
 	_ = pkCols.Iter(func(tag uint64, col schema.Column) (stop bool, err error) {
@@ -693,7 +777,7 @@ func (di *doltIndex) prollyRanges(ctx *sql.Context, ns tree.NodeStore, ranges ..
 	// really not rely on the integrator to maintain this tenuous relationship.
 	var err error
 	if !di.spatial {
-		ranges, err = pruneEmptyRanges(ranges)
+		ranges, err = pruneEmptyRanges(ctx, ranges)
 		if err != nil {
 			return nil, err
 		}
@@ -740,7 +824,7 @@ func (di *doltIndex) coversColumns(s *durableIndexState, cols []uint64) bool {
 	return covers
 }
 
-func (di *doltIndex) HandledFilters(filters []sql.Expression) []sql.Expression {
+func (di *doltIndex) HandledFilters(ctx *sql.Context, filters []sql.Expression) []sql.Expression {
 	if !di.constrainedToLookupExpression {
 		return nil
 	}
@@ -752,7 +836,7 @@ func (di *doltIndex) HandledFilters(filters []sql.Expression) []sql.Expression {
 
 	var handled []sql.Expression
 	for _, f := range filters {
-		if !expression.PreciseComparison(f) {
+		if !expression.PreciseComparison(ctx, f) {
 			continue
 		}
 		handled = append(handled, f)
@@ -785,7 +869,7 @@ func (di *doltIndex) HasContentHashedField() bool {
 			prefixLength = di.prefixLengths[i]
 		}
 
-		if sqltypes.IsTextBlob(col.TypeInfo.ToSqlType()) && prefixLength == 0 {
+		if isHashEncoded(col.TypeInfo) && prefixLength == 0 {
 			contentHashedField = true
 			return true, nil
 		}
@@ -796,15 +880,19 @@ func (di *doltIndex) HasContentHashedField() bool {
 	return contentHashedField
 }
 
-func (di *doltIndex) Order() sql.IndexOrder {
-	if di.HasContentHashedField() {
+func isHashEncoded(ti typeinfo.TypeInfo) bool {
+	return val.IsAddrEncoding(ti.Encoding()) || val.IsAdaptiveEncoding(ti.Encoding())
+}
+
+func (di *doltIndex) Order(ctx *sql.Context) sql.IndexOrder {
+	if di.HasContentHashedField() || di.IsSpatial() {
 		return sql.IndexOrderNone
 	}
 
 	return di.order
 }
 
-func (di *doltIndex) Reversible() bool {
+func (di *doltIndex) Reversible(ctx *sql.Context) bool {
 	if di.HasContentHashedField() {
 		return false
 	}
@@ -829,7 +917,7 @@ func (di *doltIndex) Expressions() []string {
 }
 
 // ExtendedExpressions implements sql.ExtendedIndex
-func (di *doltIndex) ExtendedExpressions() []string {
+func (di *doltIndex) ExtendedExpressions(ctx *sql.Context) []string {
 	pkCols := di.indexSch.GetPKCols()
 	strs := make([]string, 0, len(pkCols.Tags))
 	_ = pkCols.Iter(func(tag uint64, col schema.Column) (stop bool, err error) {
@@ -872,6 +960,11 @@ func (di *doltIndex) IsPrimaryKey() bool {
 // Comment implements sql.Index
 func (di *doltIndex) Comment() string {
 	return di.comment
+}
+
+// Predicate implements sql.PartialIndex
+func (di *doltIndex) Predicate() string {
+	return di.predicate
 }
 
 // PrefixLengths implements sql.Index
@@ -944,12 +1037,12 @@ func keyBuilderForIndex(idx durable.Index) *val.TupleBuilder {
 	return val.NewTupleBuilder(kd, m.NodeStore())
 }
 
-func pruneEmptyRanges(sqlRanges []sql.MySQLRange) (pruned []sql.MySQLRange, err error) {
+func pruneEmptyRanges(ctx context.Context, sqlRanges []sql.MySQLRange) (pruned []sql.MySQLRange, err error) {
 	pruned = make([]sql.MySQLRange, 0, len(sqlRanges))
 	for _, sr := range sqlRanges {
 		empty := false
 		for _, colExpr := range sr {
-			empty, err = colExpr.IsEmpty()
+			empty, err = colExpr.IsEmpty(ctx)
 			if err != nil {
 				return nil, err
 			} else if empty {
@@ -1055,7 +1148,7 @@ func (di *doltIndex) prollySpatialRanges(ranges []sql.MySQLRange) ([]prolly.Rang
 func (di *doltIndex) prollyRangesFromSqlRanges(ctx context.Context, ns tree.NodeStore, ranges []sql.MySQLRange, tb *val.TupleBuilder) ([]prolly.Range, error) {
 	var err error
 	if !di.spatial {
-		ranges, err = pruneEmptyRanges(ranges)
+		ranges, err = pruneEmptyRanges(ctx, ranges)
 		if err != nil {
 			return nil, err
 		}
@@ -1070,12 +1163,18 @@ func (di *doltIndex) prollyRangesFromSqlRanges(ctx context.Context, ns tree.Node
 		fields := make([]prolly.RangeField, len(rng))
 		skipRangeMatchCallback := true
 		for j, expr := range rng {
-			if !sqltypes.IsInteger(expr.Typ) {
-				// String, decimal, float, datetime ranges can return
-				// false positive prefix matches. More precise range.Matches
-				// comparison is required.
+			// String, decimal, float, datetime ranges can return
+			// false positive prefix matches. More precise range.Matches
+			// comparison is required.
+			if extTyp, ok := expr.Typ.(sql.ExtendedType); ok {
+				// TODO: is there a better way to tell if this is an INT?
+				if !vttypes.IsIntegral(extTyp.Type()) {
+					skipRangeMatchCallback = false
+				}
+			} else if !sqltypes.IsInteger(expr.Typ) {
 				skipRangeMatchCallback = false
 			}
+
 			if rangeCutIsBinding(expr.LowerBound) {
 				// accumulate bound values in |tb|
 				v, err := getRangeCutValue(ctx, expr.LowerBound, rng[j].Typ)
@@ -1096,7 +1195,7 @@ func (di *doltIndex) prollyRangesFromSqlRanges(ctx context.Context, ns tree.Node
 			}
 		}
 		// BuildPermissive() allows nulls in non-null fields
-		tup, err := tb.BuildPermissive(sharePool)
+		tup, err := tb.BuildPermissive(ctx, sharePool)
 		if err != nil {
 			return nil, err
 		}
@@ -1132,7 +1231,7 @@ func (di *doltIndex) prollyRangesFromSqlRanges(ctx context.Context, ns tree.Node
 			}
 		}
 
-		tup, err = tb.BuildPermissive(sharePool)
+		tup, err = tb.BuildPermissive(ctx, sharePool)
 		if err != nil {
 			return nil, err
 		}
@@ -1146,7 +1245,10 @@ func (di *doltIndex) prollyRangesFromSqlRanges(ctx context.Context, ns tree.Node
 		for i, field := range fields {
 			// lookups on non-unique indexes can't be point lookups
 			typ := di.keyBld.Desc.Types[i]
-			cmp := order.CompareValues(ctx, i, field.Hi.Value, field.Lo.Value, typ)
+			cmp, err := order.CompareValues(ctx, i, field.Hi.Value, field.Lo.Value, typ)
+			if err != nil {
+				return nil, err
+			}
 			fields[i].BoundsAreEqual = cmp == 0
 
 			if !di.unique {
@@ -1206,18 +1308,18 @@ func getRangeCutValue(ctx context.Context, cut sql.MySQLRangeCut, typ sql.Type) 
 //
 // This is for building physical scans against storage which does not store
 // NULL contiguous and ordered < non-NULL values.
-func SplitNullsFromRange(r sql.MySQLRange) ([]sql.MySQLRange, error) {
+func SplitNullsFromRange(ctx context.Context, r sql.MySQLRange) ([]sql.MySQLRange, error) {
 	res := []sql.MySQLRange{{}}
 
 	for _, rce := range r {
 		if _, ok := rce.LowerBound.(sql.BelowNull); ok {
 			// May include NULL. Split it and add each non-empty range.
-			withnull, nullok, err := rce.TryIntersect(sql.NullRangeColumnExpr(rce.Typ))
+			withnull, nullok, err := rce.TryIntersect(ctx, sql.NullRangeColumnExpr(rce.Typ))
 			if err != nil {
 				return nil, err
 			}
 			fornull := res[:]
-			withoutnull, withoutnullok, err := rce.TryIntersect(sql.NotNullRangeColumnExpr(rce.Typ))
+			withoutnull, withoutnullok, err := rce.TryIntersect(ctx, sql.NotNullRangeColumnExpr(rce.Typ))
 			if err != nil {
 				return nil, err
 			}

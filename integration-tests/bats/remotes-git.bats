@@ -1,5 +1,6 @@
 #!/usr/bin/env bats
 load $BATS_TEST_DIRNAME/helper/common.bash
+load $BATS_TEST_DIRNAME/helper/git-ssh-common.bash
 
 setup() {
     skiponwindows "tests are flaky on Windows"
@@ -14,6 +15,9 @@ setup() {
 }
 
 teardown() {
+    teardown_git_wrapper
+    teardown_git_ssh
+    teardown_git_repo
     assert_feature_version
     teardown_common
 }
@@ -532,7 +536,7 @@ seed_git_remote_branch() {
 
     [ "$status" -ne 0 ]
     [ "$status" -ne 124 ]
-    [[ "$output" =~ "git authentication required but interactive prompting is disabled" ]] || false
+    [[ "$output" =~ "hint: dolt does not support interactive credential prompts" ]] || false
     [[ "$output" =~ "terminal prompts disabled" ]] || false
 }
 
@@ -583,6 +587,78 @@ seed_git_remote_branch() {
         false
     fi
 }
+
+_init_repo_with_remote() {
+    mkdir repo1
+    cd repo1
+    dolt init
+    dolt commit --allow-empty -m "init"
+    dolt remote add origin "$1"
+}
+
+@test "remotes-git: GIT_SSH_COMMAND set by user is not clobbered" {
+    # See https://github.com/dolthub/dolt/issues/10811.
+    setup_git_repo
+    setup_git_ssh_wrapper
+    hook_git_ssh_record_env "GIT_SSH_COMMAND"
+    _init_repo_with_remote "git@localhost:${GIT_REMOTE_DIR}"
+
+    run dolt push origin main
+    [ "$status" -eq 0 ]
+    [ -f "$BATS_TEST_TMPDIR/git_env_GIT_SSH_COMMAND" ]
+}
+
+# bats test_tags=no_lambda
+@test "remotes-git: ssh passphrase prompt is blocked and returns normalized error" {
+    # See https://github.com/dolthub/dolt/issues/10811.
+    setup_git_repo
+    setup_git_sshd
+    gen_ssh_key "$BATS_TMPDIR/ssh_key_locked" "test_passphrase"
+    export GIT_SSH_COMMAND="ssh -i $BATS_TMPDIR/ssh_key_locked -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+    unset SSH_AUTH_SOCK
+    _init_repo_with_remote "git+ssh://$(whoami)@127.0.0.1:${SSHD_PORT}${GIT_REMOTE_DIR}"
+
+    # expect allocates a real PTY for the dolt process so the test can verify
+    # that git subprocesses cannot reach it to prompt for a passphrase.
+    run expect "$BATS_TEST_DIRNAME/remotes-git-ssh-prompt.expect" "Enter passphrase"
+    [ "$status" -ne 0 ]
+    [[ "$output" =~ "hint: dolt does not support interactive credential prompts" ]] || false
+}
+
+# bats test_tags=no_lambda
+@test "remotes-git: host key prompt is blocked and returns error" {
+    # See https://github.com/dolthub/dolt/issues/10811.
+    setup_git_repo
+    setup_git_sshd
+    gen_ssh_key "$BATS_TMPDIR/ssh_key_unlocked" ""
+    # An empty known_hosts file causes SSH to default to StrictHostKeyChecking=ask
+    # and prompt for host key confirmation. expect verifies the prompt cannot reach
+    # the controlling terminal.
+    touch "$BATS_TMPDIR/ssh_known_hosts_empty"
+    export GIT_SSH_COMMAND="ssh -i $BATS_TMPDIR/ssh_key_unlocked -o IdentitiesOnly=yes -o UserKnownHostsFile=$BATS_TMPDIR/ssh_known_hosts_empty"
+    _init_repo_with_remote "git+ssh://$(whoami)@127.0.0.1:${SSHD_PORT}${GIT_REMOTE_DIR}"
+
+    run expect "$BATS_TEST_DIRNAME/remotes-git-ssh-prompt.expect" "The authenticity of host"
+    [ "$status" -ne 0 ]
+    [[ "$output" =~ "Host key verification failed" ]] || false
+
+    export GIT_SSH_COMMAND="ssh -i $BATS_TMPDIR/ssh_key_unlocked -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+    run dolt push origin main
+    [ "$status" -eq 0 ]
+}
+
+# bats test_tags=no_lambda
+@test "remotes-git: ssh push without passphrase prompt succeeds" {
+    setup_git_repo
+    setup_git_sshd
+    gen_ssh_key "$BATS_TMPDIR/ssh_key_unlocked" ""
+    export GIT_SSH_COMMAND="ssh -i $BATS_TMPDIR/ssh_key_unlocked -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+    _init_repo_with_remote "git+ssh://$(whoami)@127.0.0.1:${SSHD_PORT}${GIT_REMOTE_DIR}"
+
+    run dolt push origin main
+    [ "$status" -eq 0 ]
+}
+
 
 install_fake_git_url_recorder() {
     # Fake git that records the URL passed to `git remote add` so tests can
@@ -718,4 +794,121 @@ echo "fatal: could not read Username for 'https://example.com/org/repo.git': ter
 exit 128
 EOF
     chmod +x "$BATS_TMPDIR/fakebin/git"
+}
+
+# seed_table_with_many_chunks fills a Dolt table with enough distinct rows to
+# produce a table file of hundreds of storage chunks. Runs in the current
+# repository.
+# Arguments:
+#   $1  table name, defaults to t
+#   $2  value added to every primary key, so separate calls produce distinct
+#       chunks rather than identical ones that the store would dedupe
+seed_table_with_many_chunks() {
+    local table="${1:-t}"
+    local pk_offset="${2:-0}"
+    local csv_file
+    csv_file="$(mktemp "${BATS_TEST_TMPDIR:-$BATS_TMPDIR}/dolt-many-chunks-XXXXXX.csv")"
+    printf 'pk,a,b,c\n' > "$csv_file"
+    # awk represents numbers as doubles, so a hex conversion of a value above
+    # 2^32 saturates and the columns stop varying. Taking the product mod 2^32
+    # keeps each column distinct per row so the rows do not dedupe into a few
+    # chunks.
+    awk -v offset="$pk_offset" 'BEGIN { modulus = 4294967296; for (i = 1; i <= 30000; i++) printf "%d,%064x,%064x,%064x\n", i + offset, (i*2654435761)%modulus, (i*2246822519)%modulus, (i*3266489917)%modulus }' >> "$csv_file"
+    dolt table import -c -pk pk "$table" "$csv_file"
+    rm -f "$csv_file"
+    dolt add .
+    dolt commit -m "import many rows into $table"
+}
+
+# assert_catfile_calls_under runs the given dolt command under a git wrapper that
+# counts cat-file calls and asserts it makes fewer than the given maximum. It
+# first checks that the remote holds a large table, since the count proves
+# nothing otherwise. Run it from the directory where the command should execute.
+# Arguments:
+#   $1  maximum number of git cat-file calls allowed
+#   $@  (rest) the dolt command to run, for example dolt clone <url> <dir>
+assert_catfile_calls_under() {
+    local max_calls="$1"
+    shift
+    local data_blob_size
+    data_blob_size="$(largest_data_blob_size "$GIT_REMOTE_DIR")"
+    [ -n "$data_blob_size" ] || {
+        echo "No data blob found in the remote. Check that the push wrote a table file."
+        false
+    }
+    [ "$data_blob_size" -gt 100000 ] || {
+        echo "Largest data blob is only $data_blob_size bytes, too few chunks to test."
+        echo "Raise the row count in seed_table_with_many_chunks."
+        false
+    }
+
+    setup_git_wrapper
+    hook_git_count_subcommand cat-file
+    run "$@"
+    log_status_eq 0
+
+    local catfile_calls
+    catfile_calls="$(git_subcommand_count cat-file)"
+    [ "$catfile_calls" -lt "$max_calls" ] || {
+        echo "git cat-file ran ${catfile_calls} times (limit ${max_calls})."
+        echo "Reading each chunk must not start its own git process."
+        false
+    }
+}
+
+@test "remotes-git: clone from git remote uses O(1) git cat-file calls" {
+    # See https://github.com/dolthub/dolt/issues/11236
+    setup_git_repo
+    _init_repo_with_remote "git+file://$GIT_REMOTE_DIR"
+    seed_table_with_many_chunks
+    run dolt push --set-upstream origin main
+    [ "$status" -eq 0 ]
+    src_root=$(dolt sql -q "select dolt_hashof_db()" -r csv | tail -n 1)
+    cd ..
+
+    assert_catfile_calls_under 50 \
+        dolt clone --depth 1 "git+file://$GIT_REMOTE_DIR" dolt-repo-clones/repo2
+
+    cd dolt-repo-clones/repo2
+    run dolt sql -q "select dolt_hashof_db()" -r csv
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "$src_root" ]] || false
+    run dolt sql -q "select count(*) from t" -r csv
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "30000" ]] || false
+}
+
+@test "remotes-git: fetch from git remote uses O(1) git cat-file calls" {
+    # See https://github.com/dolthub/dolt/issues/11236
+    setup_git_repo
+    _init_repo_with_remote "git+file://$GIT_REMOTE_DIR"
+    seed_table_with_many_chunks
+    run dolt push --set-upstream origin main
+    [ "$status" -eq 0 ]
+    cd ..
+
+    cd dolt-repo-clones
+    run dolt clone "git+file://$GIT_REMOTE_DIR" repo2
+    [ "$status" -eq 0 ]
+    cd ..
+
+    # Push a second large table so the fetch has new chunks to read.
+    cd repo1
+    seed_table_with_many_chunks t2 1000000
+    run dolt push origin main
+    [ "$status" -eq 0 ]
+    src_root=$(dolt sql -q "select dolt_hashof_db()" -r csv | tail -n 1)
+    cd ..
+
+    cd dolt-repo-clones/repo2
+    assert_catfile_calls_under 50 dolt fetch origin
+
+    run dolt merge origin/main
+    [ "$status" -eq 0 ]
+    run dolt sql -q "select dolt_hashof_db()" -r csv
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "$src_root" ]] || false
+    run dolt sql -q "select count(*) from t2" -r csv
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "30000" ]] || false
 }

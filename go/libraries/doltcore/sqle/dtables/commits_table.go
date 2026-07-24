@@ -48,7 +48,7 @@ func NewCommitsTable(_ *sql.Context, dbName, tableName string, ddb *doltdb.DoltD
 }
 
 func (ct *CommitsTable) DataLength(ctx *sql.Context) (uint64, error) {
-	numBytesPerRow := schema.SchemaAvgLength(ct.Schema())
+	numBytesPerRow := schema.SchemaAvgLength(ct.Schema(ctx))
 	numRows, _, err := ct.RowCount(ctx)
 	if err != nil {
 		return 0, err
@@ -71,13 +71,16 @@ func (ct *CommitsTable) String() string {
 }
 
 // Schema is a sql.Table interface function that gets the sql.Schema of the commits system table.
-func (ct *CommitsTable) Schema() sql.Schema {
+func (ct *CommitsTable) Schema(ctx *sql.Context) sql.Schema {
 	return []*sql.Column{
 		{Name: "commit_hash", Type: types.Text, Source: ct.tableName, PrimaryKey: true, DatabaseSource: ct.dbName},
 		{Name: "committer", Type: types.Text, Source: ct.tableName, PrimaryKey: false, DatabaseSource: ct.dbName},
 		{Name: "email", Type: types.Text, Source: ct.tableName, PrimaryKey: false, DatabaseSource: ct.dbName},
 		{Name: "date", Type: types.Datetime3, Source: ct.tableName, PrimaryKey: false, DatabaseSource: ct.dbName},
 		{Name: "message", Type: types.Text, Source: ct.tableName, PrimaryKey: false, DatabaseSource: ct.dbName},
+		{Name: "author", Type: types.Text, Source: ct.tableName, PrimaryKey: false, DatabaseSource: ct.dbName},
+		{Name: "author_email", Type: types.Text, Source: ct.tableName, PrimaryKey: false, DatabaseSource: ct.dbName},
+		{Name: "author_date", Type: types.Datetime3, Source: ct.tableName, PrimaryKey: false, DatabaseSource: ct.dbName},
 	}
 }
 
@@ -121,7 +124,7 @@ func (ct *CommitsTable) LookupPartitions(ctx *sql.Context, lookup sql.IndexLooku
 	if lookup.Index.ID() == index.CommitHashIndexId {
 		hashStrs, ok := index.LookupToPointSelectStr(lookup)
 		if !ok {
-			return nil, fmt.Errorf("failed to parse commit lookup ranges: %s", sql.DebugString(lookup.Ranges))
+			return nil, fmt.Errorf("failed to parse commit lookup ranges: %s", sql.DebugString(ctx, lookup.Ranges))
 		}
 		hashes, commits, metas := index.HashesToCommits(ctx, ct.ddb, hashStrs, nil, false)
 		if len(hashes) == 0 {
@@ -175,5 +178,5 @@ func (itr CommitsRowItr) Close(*sql.Context) error {
 }
 
 func formatCommitTableRow(h hash.Hash, meta *datas.CommitMeta) sql.Row {
-	return sql.NewRow(h.String(), meta.Name, meta.Email, meta.Time(), meta.Description)
+	return sql.NewRow(h.String(), meta.Committer.Name, meta.Committer.Email, meta.Committer.Date.Time(), meta.Description, meta.Author.Name, meta.Author.Email, meta.Author.Date.Time())
 }

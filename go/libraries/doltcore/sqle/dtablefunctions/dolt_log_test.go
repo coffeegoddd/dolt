@@ -75,7 +75,7 @@ func TestDoltLogExpressionsInterface(t *testing.T) {
 		expression.NewLiteral("HEAD~1", types.Text),
 	}
 
-	newNode, err := ltf.WithExpressions(newExprs...)
+	newNode, err := ltf.WithExpressions(sql.NewEmptyContext(), newExprs...)
 	require.NoError(t, err)
 
 	newLtf, ok := newNode.(*LogTableFunction)
@@ -167,7 +167,7 @@ func TestDoltLogBindVariableWithParents(t *testing.T) {
 	assert.True(t, newLtf.showParents)
 
 	// Schema should include parents column during analysis when --parents is literal
-	schema := newLtf.Schema()
+	schema := newLtf.Schema(ctx)
 	parentColumn := false
 	for _, col := range schema {
 		if col.Name == "parents" {
@@ -192,7 +192,7 @@ func TestDoltLogBindVariableWithParents(t *testing.T) {
 	assert.True(t, newLtf.showParents)
 
 	// Schema should still include parents column (unchanged from analysis)
-	schemaAfterExecution := newLtf.Schema()
+	schemaAfterExecution := newLtf.Schema(ctx)
 	parentColumnAfterExecution := false
 	for _, col := range schemaAfterExecution {
 		if col.Name == "parents" {
@@ -207,7 +207,6 @@ func TestDoltLogBindVariableAsOption(t *testing.T) {
 	ctx := sql.NewEmptyContext()
 
 	// Test where the bind variable itself is an option flag like --parents
-	// This tests the case where schema-affecting flags are also bind variables
 	ltf := &LogTableFunction{}
 
 	// Test case: dolt_log("HEAD", ?) where ? will be "--parents"
@@ -216,8 +215,8 @@ func TestDoltLogBindVariableAsOption(t *testing.T) {
 		expression.NewBindVar("flag"),
 	}
 
-	// During analysis phase, schema determination should not include parents column
-	// because --parents is in a bind variable, not a literal
+	// During analysis the schema is the fixed shape, so the parents column is present
+	// regardless of whether --parents arrives as a literal or a bind variable.
 	node, err := ltf.deferExpressions(ctx, bindVarAsOptionExprs...)
 	assert.NoError(t, err)
 	assert.NotNil(t, node)
@@ -233,8 +232,9 @@ func TestDoltLogBindVariableAsOption(t *testing.T) {
 	// showParents should be false during analysis (flag is in bind variable)
 	assert.False(t, newLtf.showParents)
 
-	// Schema should NOT include parents column during analysis (flag is in bind variable)
-	schema := newLtf.Schema()
+	// Schema is fixed and always includes the parents column, regardless of whether
+	// --parents is in a bind variable or a literal.
+	schema := newLtf.Schema(ctx)
 	parentColumn := false
 	for _, col := range schema {
 		if col.Name == "parents" {
@@ -242,7 +242,7 @@ func TestDoltLogBindVariableAsOption(t *testing.T) {
 			break
 		}
 	}
-	assert.False(t, parentColumn, "parents column should not be in schema when --parents is in bind variable")
+	assert.True(t, parentColumn, "parents column should always be in the fixed schema")
 
 	// Now test execution phase - simulate what happens when bind variable is resolved
 	// This simulates the SQL engine substituting the bind variable with the actual value

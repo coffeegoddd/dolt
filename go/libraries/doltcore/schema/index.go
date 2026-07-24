@@ -14,6 +14,12 @@
 
 package schema
 
+import (
+	"slices"
+
+	"github.com/dolthub/dolt/go/store/val"
+)
+
 type Index interface {
 	// AllTags returns the tags of the columns in the entire index, including the primary keys.
 	// If we imagined a dolt index as being a standard dolt table, then the tags would represent the schema columns.
@@ -50,15 +56,75 @@ type Index interface {
 	PrimaryKeyTags() []uint64
 	// Schema returns the schema for the internal index map. Can be used for table operations.
 	Schema() Schema
+	// Predicate returns the WHERE clause expression string for partial indexes, or "" for full indexes.
+	Predicate() string
 	// PrefixLengths returns the prefix lengths for the index
 	PrefixLengths() []uint16
 	// FullTextProperties returns all properties belonging to a Full-Text index.
 	FullTextProperties() FullTextProperties
 	// VectorProperties returns all properties belonging to a vector index.
 	VectorProperties() VectorProperties
+	// CoversAllNonGeneratedColumns returns whether the index covers every non-generated column in the table.
+	CoversAllNonVirtualColumns() bool
 }
 
 var _ Index = (*indexImpl)(nil)
+
+// PrimaryIndexOrdinalToSecondaryIndexOrdinal produces a mapping from a column's offset in the primary index to the same column's offset in the supplied index.
+// Since all secondary indexes implicitly include all primary key columns, this mapping is guaranteed to be dense.
+func PrimaryIndexOrdinalToSecondaryIndexOrdinal(idx Index) (pkMap val.OrdinalMapping) {
+	pkTags := idx.PrimaryKeyTags()
+	allTags := idx.AllTags()
+	if len(pkTags) == 0 { // keyless index
+		pkMap = make(val.OrdinalMapping, 1)
+		pkMap[0] = len(allTags)
+		return pkMap
+	}
+
+	pkMap = make(val.OrdinalMapping, len(pkTags))
+	for i, pk := range pkTags {
+		for j, tag := range allTags {
+			if tag == pk {
+				pkMap[i] = j
+				break
+			}
+		}
+	}
+	return pkMap
+}
+
+// IndexOrdinalToTableOrdinal produces a mapping from a column's offset in the supplied index to the same column's offset in table storage.
+// TODO: Since it's possible to have both virtual columns that don't map onto storage, and storage columns that aren't in the index,
+// OrdinalMapping is a bad fit for the return type. It should be a map[int]int instead.
+func IndexOrdinalToStorageOrdinal(sch Schema, idx Index) (ord val.OrdinalMapping) {
+	ord = make(val.OrdinalMapping, len(idx.AllTags()))
+
+	for i, tag := range idx.AllTags() {
+		pkIdx, ok := sch.GetPKCols().tagToStorageIndex[tag]
+		if ok {
+			ord[i] = pkIdx
+			continue
+		}
+		nonPkIdx, ok := sch.GetNonPKCols().tagToStorageIndex[tag]
+		if ok {
+			ord[i] = nonPkIdx + sch.GetPKCols().Size()
+			continue
+		}
+		ord[i] = -1
+	}
+	return ord
+}
+
+// IndexOrdinalToTableOrdinal produces a mapping from a column's offset in the supplied index to the same column's offset in the table schema.
+func IndexOrdinalToTableOrdinal(sch Schema, idx Index) val.OrdinalMapping {
+	schemaTags := sch.GetAllCols().TagToIdx
+	indexTags := idx.AllTags()
+	ordinalMap := make(val.OrdinalMapping, len(indexTags))
+	for i, pk := range indexTags {
+		ordinalMap[i] = schemaTags[pk]
+	}
+	return ordinalMap
+}
 
 type indexImpl struct {
 	name             string
@@ -71,6 +137,7 @@ type indexImpl struct {
 	isVector         bool
 	isUserDefined    bool
 	comment          string
+	predicate        string
 	prefixLengths    []uint16
 	fullTextProps    FullTextProperties
 	vectorProperties VectorProperties
@@ -93,6 +160,7 @@ func NewIndex(name string, tags, allTags []uint64, indexColl IndexCollection, pr
 		isVector:         props.IsVector,
 		isUserDefined:    props.IsUserDefined,
 		comment:          props.Comment,
+		predicate:        props.Predicate,
 		fullTextProps:    props.FullTextProperties,
 		vectorProperties: props.VectorProperties,
 	}
@@ -115,6 +183,11 @@ func (ix *indexImpl) ColumnNames() []string {
 // Comment implements Index.
 func (ix *indexImpl) Comment() string {
 	return ix.comment
+}
+
+// Predicate implements Index.
+func (ix *indexImpl) Predicate() string {
+	return ix.predicate
 }
 
 // Count implements Index.
@@ -141,6 +214,7 @@ func (ix *indexImpl) Equals(other Index) bool {
 		ix.IsSpatial() == other.IsSpatial() &&
 		compareUint16Slices(ix.PrefixLengths(), other.PrefixLengths()) &&
 		ix.Comment() == other.Comment() &&
+		ix.Predicate() == other.Predicate() &&
 		ix.Name() == other.Name()
 }
 
@@ -163,6 +237,7 @@ func (ix *indexImpl) DeepEquals(other Index) bool {
 		ix.IsSpatial() == other.IsSpatial() &&
 		compareUint16Slices(ix.PrefixLengths(), other.PrefixLengths()) &&
 		ix.Comment() == other.Comment() &&
+		ix.Predicate() == other.Predicate() &&
 		ix.Name() == other.Name()
 }
 
@@ -245,6 +320,7 @@ func (ix *indexImpl) Schema() Schema {
 		// contentHashedFields is the collection of column tags for columns in a unique index that do
 		// not have a prefix length specified and should be stored as a content hash. This information
 		// is needed to later identify that an index is using content-hashed encoding.
+		// TODO: this is imprecise, we need the encoding information from the column type
 		prefixLength := uint16(0)
 		if len(ix.PrefixLengths()) > i {
 			prefixLength = ix.PrefixLengths()[i]
@@ -296,4 +372,29 @@ func (ix *indexImpl) copy() *indexImpl {
 		_ = copy(newIx.fullTextProps.KeyPositions, ix.fullTextProps.KeyPositions)
 	}
 	return &newIx
+}
+
+func (ix *indexImpl) CoversAllNonVirtualColumns() bool {
+	if len(ix.prefixLengths) > 0 {
+		return false
+	}
+
+	if ix.IsSpatial() {
+		return false
+	}
+
+	indexTags := ix.AllTags()
+
+	for _, column := range ix.indexColl.colColl.cols {
+		// Every column in the table must be either covered by the index, or generated
+		if column.Virtual {
+			continue
+		}
+
+		if !slices.Contains(indexTags, column.Tag) {
+			return false
+		}
+	}
+
+	return true
 }

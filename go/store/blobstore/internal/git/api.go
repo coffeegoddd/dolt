@@ -69,6 +69,9 @@ type GitAPI interface {
 	// BlobReader returns a reader for blob contents.
 	BlobReader(ctx context.Context, oid OID) (io.ReadCloser, error)
 
+	// BlobSizes returns the sizes of |oids| in the same order, and an error if any is missing.
+	BlobSizes(ctx context.Context, oids []OID) ([]int64, error)
+
 	// HashObject writes a new blob object for the provided contents and returns its OID.
 	// Equivalent plumbing:
 	//   GIT_DIR=... git hash-object -w --stdin
@@ -131,6 +134,10 @@ type GitAPI interface {
 	// the remote |dstRef| is missing (bootstrap / create-if-missing semantics).
 	// Equivalent plumbing: GIT_DIR=... git push --force-with-lease=<dstRef>:<expectedDstOID> <remote> <srcRef>:<dstRef>
 	PushRefWithLease(ctx context.Context, remote string, srcRef string, dstRef string, expectedDstOID OID) error
+
+	// ForcePushRef force-pushes |srcRef| to |dstRef| on |remote| unconditionally.
+	// Equivalent plumbing: GIT_DIR=... git push --force <remote> <srcRef>:<dstRef>
+	ForcePushRef(ctx context.Context, remote, srcRef, dstRef string) error
 }
 
 // TreeEntry describes one entry in a git tree listing.

@@ -21,6 +21,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cockroachdb/apd/v3"
 	gms "github.com/dolthub/go-mysql-server"
 	"github.com/dolthub/go-mysql-server/sql"
 	"github.com/dolthub/go-mysql-server/sql/planbuilder"
@@ -28,7 +29,6 @@ import (
 	"github.com/dolthub/vitess/go/vt/sqlparser"
 	"github.com/gocraft/dbr/v2"
 	"github.com/gocraft/dbr/v2/dialect"
-	"github.com/shopspring/decimal"
 	"golang.org/x/exp/constraints"
 
 	"github.com/dolthub/dolt/go/libraries/doltcore/doltdb"
@@ -54,7 +54,6 @@ type TestResult struct {
 }
 
 type TestsRunTableFunction struct {
-	ctx           *sql.Context
 	catalog       sql.Catalog
 	database      sql.Database
 	argumentExprs []sql.Expression
@@ -71,10 +70,9 @@ var testRunTableSchema = sql.Schema{
 
 func (trtf *TestsRunTableFunction) NewInstance(ctx *sql.Context, database sql.Database, expressions []sql.Expression) (sql.Node, error) {
 	newInstance := &TestsRunTableFunction{
-		ctx:      ctx,
 		database: database,
 	}
-	node, err := newInstance.WithExpressions(expressions...)
+	node, err := newInstance.WithExpressions(ctx, expressions...)
 	if err != nil {
 		return nil, err
 	}
@@ -112,7 +110,7 @@ func (trtf *TestsRunTableFunction) Expressions() []sql.Expression {
 }
 
 // WithExpressions implements the sql.Expressioner interface
-func (trtf *TestsRunTableFunction) WithExpressions(expressions ...sql.Expression) (sql.Node, error) {
+func (trtf *TestsRunTableFunction) WithExpressions(ctx *sql.Context, expressions ...sql.Expression) (sql.Node, error) {
 	for _, expr := range expressions {
 		if !expr.Resolved() {
 			return nil, ErrInvalidNonLiteralArgument.New(trtf.Name(), expr.String())
@@ -134,7 +132,7 @@ func (trtf *TestsRunTableFunction) Children() []sql.Node {
 	return nil
 }
 
-func (trtf *TestsRunTableFunction) WithChildren(node ...sql.Node) (sql.Node, error) {
+func (trtf *TestsRunTableFunction) WithChildren(ctx *sql.Context, node ...sql.Node) (sql.Node, error) {
 	if len(node) != 0 {
 		return nil, fmt.Errorf("unexpected children")
 	}
@@ -149,7 +147,7 @@ func (trtf *TestsRunTableFunction) CheckAuth(ctx *sql.Context, opChecker sql.Pri
 }
 
 // Schema implements the sql.Node interface
-func (trtf *TestsRunTableFunction) Schema() sql.Schema {
+func (trtf *TestsRunTableFunction) Schema(ctx *sql.Context) sql.Schema {
 	return testRunTableSchema
 }
 
@@ -187,7 +185,7 @@ func (trtf *TestsRunTableFunction) Name() string {
 }
 
 // RowIter implements the sql.Node interface
-func (trtf *TestsRunTableFunction) RowIter(_ *sql.Context, _ sql.Row) (sql.RowIter, error) {
+func (trtf *TestsRunTableFunction) RowIter(ctx *sql.Context, _ sql.Row) (sql.RowIter, error) {
 	args := trtf.getOptionsString()
 	if len(args) == 0 { // We treat no arguments as a wildcard
 		args = append(args, "*")
@@ -195,13 +193,13 @@ func (trtf *TestsRunTableFunction) RowIter(_ *sql.Context, _ sql.Row) (sql.RowIt
 
 	var resultRows []sql.Row
 	for _, arg := range args {
-		testRows, err := trtf.getDoltTestsData(strings.Trim(arg, "'"))
+		testRows, err := trtf.getDoltTestsData(ctx, strings.Trim(arg, "'"))
 		if err != nil {
 			return nil, err
 		}
 
 		for _, row := range testRows {
-			result, err := trtf.queryAndAssert(row)
+			result, err := trtf.queryAndAssert(ctx, row)
 			if err != nil {
 				return nil, err
 			}
@@ -215,7 +213,7 @@ func (trtf *TestsRunTableFunction) RowIter(_ *sql.Context, _ sql.Row) (sql.RowIt
 
 // DataLength estimates total data size for query planning.
 func (trtf *TestsRunTableFunction) DataLength(ctx *sql.Context) (uint64, error) {
-	numBytesPerRow := schema.SchemaAvgLength(trtf.Schema())
+	numBytesPerRow := schema.SchemaAvgLength(trtf.Schema(ctx))
 	numRows, _, err := trtf.RowCount(ctx)
 	if err != nil {
 		return 0, err
@@ -227,24 +225,24 @@ func (trtf *TestsRunTableFunction) RowCount(_ *sql.Context) (uint64, bool, error
 	return testsRunDefaultRowCount, false, nil
 }
 
-func (trtf *TestsRunTableFunction) queryAndAssert(row sql.Row) (result TestResult, err error) {
-	testName, groupName, query, assertion, comparison, value, err := parseDoltTestsRow(trtf.ctx, row)
+func (trtf *TestsRunTableFunction) queryAndAssert(ctx *sql.Context, row sql.Row) (result TestResult, err error) {
+	testName, groupName, query, assertion, comparison, value, err := parseDoltTestsRow(ctx, row)
 	if err != nil {
 		return
 	}
 
-	message, err := validateQuery(trtf.ctx, trtf.catalog, *query)
+	message, err := validateQuery(ctx, trtf.catalog, *query)
 	if err != nil && message == "" {
 		message = fmt.Sprintf("query error: %s", err.Error())
 	}
 
 	var testPassed bool
 	if message == "" {
-		_, queryResult, _, err := trtf.engine.Query(trtf.ctx, *query)
+		_, queryResult, _, err := trtf.engine.Query(ctx, *query)
 		if err != nil {
 			message = fmt.Sprintf("Query error: %s", err.Error())
 		} else {
-			testPassed, message, err = AssertData(trtf.ctx, *assertion, *comparison, value, queryResult)
+			testPassed, message, err = AssertData(ctx, *assertion, *comparison, value, queryResult)
 			if err != nil {
 				return TestResult{}, err
 			}
@@ -264,24 +262,24 @@ func (trtf *TestsRunTableFunction) queryAndAssert(row sql.Row) (result TestResul
 	return result, nil
 }
 
-func (trtf *TestsRunTableFunction) queryAndAssertWithFunc(row sql.Row, assertDataFunc AssertDataFunc) (result TestResult, err error) {
-	testName, groupName, query, assertion, comparison, value, err := parseDoltTestsRow(trtf.ctx, row)
+func (trtf *TestsRunTableFunction) queryAndAssertWithFunc(ctx *sql.Context, row sql.Row, assertDataFunc AssertDataFunc) (result TestResult, err error) {
+	testName, groupName, query, assertion, comparison, value, err := parseDoltTestsRow(ctx, row)
 	if err != nil {
 		return
 	}
 
-	message, err := validateQuery(trtf.ctx, trtf.catalog, *query)
+	message, err := validateQuery(ctx, trtf.catalog, *query)
 	if err != nil && message == "" {
 		message = fmt.Sprintf("query error: %s", err.Error())
 	}
 
 	var testPassed bool
 	if message == "" {
-		_, queryResult, _, err := trtf.engine.Query(trtf.ctx, *query)
+		_, queryResult, _, err := trtf.engine.Query(ctx, *query)
 		if err != nil {
 			message = fmt.Sprintf("Query error: %s", err.Error())
 		} else {
-			testPassed, message, err = assertDataFunc(trtf.ctx, *assertion, *comparison, value, queryResult)
+			testPassed, message, err = assertDataFunc(ctx, *assertion, *comparison, value, queryResult)
 			if err != nil {
 				return TestResult{}, err
 			}
@@ -301,7 +299,7 @@ func (trtf *TestsRunTableFunction) queryAndAssertWithFunc(row sql.Row, assertDat
 	return result, nil
 }
 
-func (trtf *TestsRunTableFunction) getDoltTestsData(arg string) ([]sql.Row, error) {
+func (trtf *TestsRunTableFunction) getDoltTestsData(ctx *sql.Context, arg string) ([]sql.Row, error) {
 	// Original behavior when root is nil - use SQL queries against current session
 	var queries []string
 
@@ -324,7 +322,7 @@ func (trtf *TestsRunTableFunction) getDoltTestsData(arg string) ([]sql.Row, erro
 	}
 
 	for _, query := range queries {
-		_, iter, _, err := trtf.engine.Query(trtf.ctx, query)
+		_, iter, _, err := trtf.engine.Query(ctx, query)
 		if err != nil {
 			return nil, err
 		}
@@ -332,7 +330,7 @@ func (trtf *TestsRunTableFunction) getDoltTestsData(arg string) ([]sql.Row, erro
 		// dolt sql-server. Since we only support `SELECT...` queries anyway, it's not necessary to Close() the iter.
 		var rows []sql.Row
 		for {
-			row, rErr := iter.Next(trtf.ctx)
+			row, rErr := iter.Next(ctx)
 			if rErr == io.EOF {
 				break
 			}
@@ -582,10 +580,11 @@ func expectSingleValue(sqlCtx *sql.Context, comparison string, value *string, qu
 			return fmt.Sprintf("Could not compare non float value '%s', with %f", *value, actualValue), nil
 		}
 		return compareTestAssertion(comparison, float32(expectedFloat), actualValue, AssertionExpectedSingleValue), nil
-	case decimal.Decimal:
-		expectedDecimal, err := decimal.NewFromString(*value)
+	case *apd.Decimal:
+		expectedDecimal, _, err := apd.NewFromString(*value)
+		actualValueStr := actualValue.Text('f')
 		if err != nil {
-			return fmt.Sprintf("Could not compare non decimal value '%s', with %s", *value, actualValue), nil
+			return fmt.Sprintf("Could not compare non decimal value '%s', with %s", *value, actualValueStr), nil
 		}
 		return compareDecimals(comparison, expectedDecimal, actualValue, AssertionExpectedSingleValue), nil
 	case time.Time:
@@ -742,31 +741,33 @@ func compareDates(comparison string, expectedValue, realValue time.Time, format 
 // compareDecimals is a function used for comparing decimals.
 // It takes in a comparison string from one of: "==", "!=", "<", ">", "<=", ">="
 // It returns a string. The string is empty if the assertion passed, or has a message explaining the failure otherwise
-func compareDecimals(comparison string, expectedValue, realValue decimal.Decimal, assertionType string) string {
+func compareDecimals(comparison string, expectedValue, realValue *apd.Decimal, assertionType string) string {
+	eVal := expectedValue.Text('f')
+	rVal := realValue.Text('f')
 	switch comparison {
 	case "==":
-		if !expectedValue.Equal(realValue) {
-			return fmt.Sprintf("Assertion failed: %s equal to %v, got %v", assertionType, expectedValue, realValue)
+		if expectedValue.Cmp(realValue) != 0 {
+			return fmt.Sprintf("Assertion failed: %s equal to %s, got %s", assertionType, eVal, rVal)
 		}
 	case "!=":
-		if expectedValue.Equal(realValue) {
-			return fmt.Sprintf("Assertion failed: %s not equal to %v, got %v", assertionType, expectedValue, realValue)
+		if expectedValue.Cmp(realValue) == 0 {
+			return fmt.Sprintf("Assertion failed: %s not equal to %s, got %s", assertionType, eVal, rVal)
 		}
 	case "<":
-		if realValue.GreaterThanOrEqual(expectedValue) {
-			return fmt.Sprintf("Assertion failed: %s less than %v, got %v", assertionType, expectedValue, realValue)
+		if realValue.Cmp(expectedValue) >= 0 {
+			return fmt.Sprintf("Assertion failed: %s less than %s, got %s", assertionType, eVal, rVal)
 		}
 	case "<=":
-		if realValue.GreaterThan(expectedValue) {
-			return fmt.Sprintf("Assertion failed: %s less than or equal to %v, got %v", assertionType, expectedValue, realValue)
+		if realValue.Cmp(expectedValue) > 0 {
+			return fmt.Sprintf("Assertion failed: %s less than or equal to %s, got %s", assertionType, eVal, rVal)
 		}
 	case ">":
-		if realValue.LessThanOrEqual(expectedValue) {
-			return fmt.Sprintf("Assertion failed: %s greater than %v, got %v", assertionType, expectedValue, realValue)
+		if realValue.Cmp(expectedValue) <= 0 {
+			return fmt.Sprintf("Assertion failed: %s greater than %s, got %s", assertionType, eVal, rVal)
 		}
 	case ">=":
-		if realValue.LessThan(expectedValue) {
-			return fmt.Sprintf("Assertion failed: %s greater than or equal to %v, got %v", assertionType, expectedValue, realValue)
+		if realValue.Cmp(expectedValue) < 0 {
+			return fmt.Sprintf("Assertion failed: %s greater than or equal to %s, got %s", assertionType, eVal, rVal)
 		}
 	default:
 		return fmt.Sprintf("%s is not a valid comparison type", comparison)

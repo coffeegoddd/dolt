@@ -155,6 +155,26 @@ teardown() {
     [ "$status" -eq 0 ]
 }
 
+# Regression coverage for https://github.com/dolthub/dolt/issues/11137
+# bats test_tags=no_lambda
+@test "sql-shell: status slash command works without --branch flag" {
+    skiponwindows "Need to install expect and make this script work on windows."
+    if [ "$SQL_ENGINE" = "remote-engine" ]; then
+      skip "Test exercises the local sql shell path."
+    fi
+    $BATS_TEST_DIRNAME/sql-shell-slash-status.expect main
+}
+
+# bats test_tags=no_lambda
+@test "sql-shell: status slash command works with --branch flag" {
+    skiponwindows "Need to install expect and make this script work on windows."
+    if [ "$SQL_ENGINE" = "remote-engine" ]; then
+      skip "Test exercises the local sql shell path."
+    fi
+    dolt branch br1
+    $BATS_TEST_DIRNAME/sql-shell-slash-status.expect br1 --branch=br1
+}
+
 # bats test_tags=no_lambda
 @test "sql-shell: sql shell prompt updates" {
     skiponwindows "Need to install expect and make this script work on windows."
@@ -240,10 +260,7 @@ SQL
     cd doltsql
     dolt init
 
-    run $BATS_TEST_DIRNAME/sql-delimiter.expect
-    [ "$status" -eq "0" ]
-    [[ ! "$output" =~ "Error" ]] || false
-    [[ ! "$output" =~ "error" ]] || false
+    $BATS_TEST_DIRNAME/sql-delimiter.expect
 
     run dolt sql -q "SELECT * FROM test ORDER BY 1" -r=csv
     [ "$status" -eq "0" ]

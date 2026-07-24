@@ -36,6 +36,7 @@ type fakeGitAPI struct {
 	blobReader          func(ctx context.Context, oid git.OID) (io.ReadCloser, error)
 	fetchRef            func(ctx context.Context, remote string, srcRef string, dstRef string) error
 	pushRefWithLease    func(ctx context.Context, remote string, srcRef string, dstRef string, expectedDstOID git.OID) error
+	forcePushRef        func(ctx context.Context, remote, srcRef, dstRef string) error
 }
 
 func (f fakeGitAPI) TryResolveRefCommit(ctx context.Context, ref string) (git.OID, bool, error) {
@@ -67,6 +68,20 @@ func (f fakeGitAPI) BlobSize(ctx context.Context, oid git.OID) (int64, error) {
 }
 func (f fakeGitAPI) BlobReader(ctx context.Context, oid git.OID) (io.ReadCloser, error) {
 	return f.blobReader(ctx, oid)
+}
+func (f fakeGitAPI) BlobSizes(ctx context.Context, oids []git.OID) ([]int64, error) {
+	if len(oids) == 0 {
+		return nil, nil
+	}
+	sizes := make([]int64, len(oids))
+	for i, oid := range oids {
+		sz, err := f.blobSize(ctx, oid)
+		if err != nil {
+			return nil, err
+		}
+		sizes[i] = sz
+	}
+	return sizes, nil
 }
 func (f fakeGitAPI) HashObject(ctx context.Context, contents io.Reader) (git.OID, error) {
 	panic("unexpected call")
@@ -109,6 +124,12 @@ func (f fakeGitAPI) PushRefWithLease(ctx context.Context, remote string, srcRef 
 		panic("unexpected call")
 	}
 	return f.pushRefWithLease(ctx, remote, srcRef, dstRef, expectedDstOID)
+}
+func (f fakeGitAPI) ForcePushRef(ctx context.Context, remote, srcRef, dstRef string) error {
+	if f.forcePushRef == nil {
+		return nil
+	}
+	return f.forcePushRef(ctx, remote, srcRef, dstRef)
 }
 
 func TestGitBlobstoreHelpers_validateAndSizeChunkedParts(t *testing.T) {

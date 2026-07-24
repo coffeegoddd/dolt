@@ -30,9 +30,10 @@ func NewInitDatabaseHook(sc *StatsController) sqle.InitDatabaseHook {
 		denv *env.DoltEnv,
 		db dsess.SqlDatabase,
 	) error {
-		if sc.hdpEnv == nil {
+		if sc.getUserHomeDir == nil {
 			sc.mu.Lock()
-			sc.hdpEnv = denv
+			sc.getUserHomeDir = denv.GetUserHomeDir
+			sc.dbLoadParams = dEnvLoadParams(denv)
 			sc.mu.Unlock()
 		}
 		sqlDb, ok := db.(sqle.Database)
@@ -49,7 +50,7 @@ func NewInitDatabaseHook(sc *StatsController) sqle.InitDatabaseHook {
 
 func NewDropDatabaseHook(sc *StatsController) sqle.DropDatabaseHook {
 	return func(ctx *sql.Context, name string) {
-		if err := sc.DropDbStats(ctx, name, false); err != nil {
+		if err := sc.DropDbStats(ctx, "", name, false); err != nil {
 			ctx.GetLogger().Debugf("failed to close stats database: %s", err)
 		}
 	}

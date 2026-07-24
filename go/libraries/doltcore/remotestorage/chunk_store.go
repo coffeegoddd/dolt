@@ -25,6 +25,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -133,6 +134,16 @@ type DoltChunkStore struct {
 	stats       cacheStats
 	logger      chunks.DebugLogger
 	wsValidate  bool
+}
+
+// hasFeature reports whether |f| appears in |md|'s advertised
+// features list. FEATURE_UNSPECIFIED is treated as always absent.
+// |md| may be nil.
+func hasFeature(md *remotesapi.GetRepoMetadataResponse, f remotesapi.Feature) bool {
+	if md == nil || f == remotesapi.Feature_FEATURE_UNSPECIFIED {
+		return false
+	}
+	return slices.Contains(md.Features, f)
 }
 
 func NewDoltChunkStoreFromPath(
@@ -271,8 +282,8 @@ type CacheStats interface {
 	CacheHits() uint32
 }
 
-func (dcs *DoltChunkStore) ChunkFetcher(ctx context.Context) nbs.ChunkFetcher {
-	return NewChunkFetcher(ctx, dcs)
+func (dcs *DoltChunkStore) ChunkFetcher(ctx context.Context, recorder nbs.StatsRecorder) nbs.ChunkFetcher {
+	return NewChunkFetcher(ctx, dcs, recorder)
 }
 
 // Get the Chunk for the value of the hash in the store. If the hash is absent from the store EmptyChunk is returned.
@@ -424,7 +435,7 @@ func sortRangesBySize(ranges []*GetRange) {
 
 type resourcePathToUrlFunc func(ctx context.Context, lastError error, resourcePath string) (url string, err error)
 
-func (gr *GetRange) GetDownloadFunc(ctx context.Context, stats StatsRecorder, health reliable.HealthRecorder, fetcher HTTPFetcher, params NetworkRequestParams, resCb func(context.Context, []byte, *Range) error, pathToUrl resourcePathToUrlFunc) func() error {
+func (gr *GetRange) GetDownloadFunc(ctx context.Context, stats StatsRecorder, health reliable.HealthRecorder, fetcher HTTPFetcher, params NetworkRequestParams, logf func(string, ...interface{}), resCb func(context.Context, []byte, *Range) error, pathToUrl resourcePathToUrlFunc) func() error {
 	if len(gr.Ranges) == 0 {
 		return func() error { return nil }
 	}
@@ -448,6 +459,7 @@ func (gr *GetRange) GetDownloadFunc(ctx context.Context, stats StatsRecorder, he
 			UrlFact: urlF,
 			Stats:   stats,
 			Health:  health,
+			Logf:    logf,
 			BackOffFact: func(ctx context.Context) backoff.BackOff {
 				return downloadBackOff(ctx, params.DownloadRetryCount)
 			},
@@ -558,6 +570,11 @@ func (r *locationRefresh) GetURL(ctx context.Context, lastError error, client re
 		wantsRefresh := now.After(r.RefreshAfter) || errors.Is(lastError, HttpError)
 		canRefresh := time.Since(r.lastRefresh) > refreshTableFileURLRetryDuration
 		if wantsRefresh && canRefresh {
+			// The request was prebuilt by the server (echo pattern);
+			// the client is authoritative for its own capability set
+			// and must stamp it at send time. See the ClientCapability
+			// enum comment in chunkstore.proto.
+			r.RefreshRequest.ClientCapabilities = clientCapabilities
 			ctx, cancel := context.WithTimeout(ctx, refreshTableFileURLTimeout)
 			resp, err := client.RefreshTableFileUrl(ctx, r.RefreshRequest)
 			cancel()
@@ -581,7 +598,7 @@ type RepoRequest interface {
 func (dcs *DoltChunkStore) readChunksAndCache(ctx context.Context, hashes []hash.Hash, found func(context.Context, nbs.ToChunker)) (err error) {
 	toSend := hash.NewHashSet(hashes...)
 
-	fetcher := dcs.ChunkFetcher(ctx)
+	fetcher := dcs.ChunkFetcher(ctx, nil)
 	defer func() {
 		cerr := fetcher.Close()
 		if err == nil {
@@ -725,7 +742,7 @@ func (dcs *DoltChunkStore) errorIfDangling(ctx context.Context, addrs hash.HashS
 // subsequent Get and Has calls, but must not be persistent until a call
 // to Flush(). Put may be called concurrently with other calls to Put(),
 // Get(), GetMany(), Has() and HasMany().
-func (dcs *DoltChunkStore) Put(ctx context.Context, c chunks.Chunk, getAddrs chunks.GetAddrsCurry) error {
+func (dcs *DoltChunkStore) Put(ctx context.Context, c chunks.Chunk, getAddrs chunks.InsertAddrsCurry) error {
 	addrs := hash.NewHashSet()
 	err := getAddrs(c)(ctx, addrs, func(h hash.Hash) bool { return false })
 	if err != nil {
@@ -902,6 +919,10 @@ func (dcs *DoltChunkStore) Close() error {
 	return dcs.finalizer()
 }
 
+func (dcs *DoltChunkStore) Teardown(ctx context.Context) error {
+	return nil
+}
+
 // Uploads all chunks in |hashToChunk| to the remote store and returns
 // the manifest entries that correspond to the new table files. Used
 // by |Commit|. Typically |hashToChunk| will have come from our |wb|
@@ -1066,13 +1087,13 @@ const (
 	chunkAggDistance = 8 * 1024
 )
 
-func (dcs *DoltChunkStore) SupportedOperations() chunks.TableFileStoreOps {
+func (dcs *DoltChunkStore) SupportedOperations(_ context.Context) (chunks.TableFileStoreOps, error) {
 	return chunks.TableFileStoreOps{
 		CanRead:  true,
 		CanWrite: true,
 		CanPrune: false,
 		CanGC:    false,
-	}
+	}, nil
 }
 
 // WriteTableFile reads a table file from the provided reader and writes it to the chunk store.
@@ -1093,9 +1114,9 @@ func (dcs *DoltChunkStore) WriteTableFile(ctx context.Context, fileId string, sp
 
 // AddTableFilesToManifest adds table files to the manifest
 //
-// GetAddrsCurry here is unused, because the remote is responsible for
+// InsertAddrsCurry here is unused, because the remote is responsible for
 // any reference checking, not the remotestorage instance.
-func (dcs *DoltChunkStore) AddTableFilesToManifest(ctx context.Context, fileIdToNumChunks map[string]int, _ chunks.GetAddrsCurry) error {
+func (dcs *DoltChunkStore) AddTableFilesToManifest(ctx context.Context, fileIdToNumChunks map[string]int, _ chunks.InsertAddrsCurry) error {
 	chnkTblInfo := make([]*remotesapi.ChunkTableInfo, 0, len(fileIdToNumChunks))
 
 	debugStr := ""
@@ -1143,7 +1164,7 @@ func (dcs *DoltChunkStore) PruneTableFiles(ctx context.Context) error {
 // and a list of only appendix table files
 func (dcs *DoltChunkStore) Sources(ctx context.Context) (chunks.TableFileSources, error) {
 	id, token := dcs.getRepoId()
-	req := &remotesapi.ListTableFilesRequest{RepoId: id, RepoPath: dcs.repoPath, RepoToken: token}
+	req := &remotesapi.ListTableFilesRequest{RepoId: id, RepoPath: dcs.repoPath, RepoToken: token, ClientCapabilities: clientCapabilities}
 	resp, err := dcs.csClient.ListTableFiles(ctx, req)
 	if err != nil {
 		return chunks.TableFileSources{}, NewRpcError(err, "ListTableFiles", dcs.host, req)
@@ -1234,7 +1255,12 @@ func sanitizeSignedUrl(url string) string {
 
 // Open returns an io.ReadCloser which can be used to read the bytes of a table file.
 func (drtf DoltRemoteTableFile) Open(ctx context.Context) (io.ReadCloser, uint64, error) {
-	if drtf.info.RefreshAfter != nil && time.Now().After(drtf.info.RefreshAfter.AsTime()) {
+	if drtf.info.RefreshRequest != nil && drtf.info.RefreshAfter != nil && time.Now().After(drtf.info.RefreshAfter.AsTime()) {
+		// The request was prebuilt by the server (echo pattern);
+		// the client is authoritative for its own capability set
+		// and must stamp it at send time. See the ClientCapability
+		// enum comment in chunkstore.proto.
+		drtf.info.RefreshRequest.ClientCapabilities = clientCapabilities
 		resp, err := drtf.dcs.csClient.RefreshTableFileUrl(ctx, drtf.info.RefreshRequest)
 		if err == nil {
 			drtf.info.Url = resp.Url

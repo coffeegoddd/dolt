@@ -18,7 +18,6 @@ import (
 	"fmt"
 	"io"
 	"strings"
-	"time"
 
 	gms "github.com/dolthub/go-mysql-server"
 	"github.com/dolthub/go-mysql-server/sql"
@@ -33,16 +32,18 @@ const CommitVerificationFailedPrefix = "commit verification failed:"
 
 var ErrCommitVerificationFailed = goerrors.NewKind(CommitVerificationFailedPrefix + " %s")
 
+// CommitStagedProps contains the parameters for a staged commit operation.
 type CommitStagedProps struct {
 	Message          string
-	Date             time.Time
 	AllowEmpty       bool
 	SkipEmpty        bool
 	Amend            bool
 	Force            bool
-	Name             string
-	Email            string
 	SkipVerification bool
+	// Author is the identity of the person who wrote the change.
+	Author datas.CommitIdent
+	// Committer is the identity of the person who applied the change.
+	Committer datas.CommitIdent
 }
 
 const (
@@ -86,6 +87,27 @@ func GetCommitStaged(
 		return nil, datas.ErrEmptyCommitMessage
 	}
 
+	allowEmpty := ws.MergeActive() || props.AllowEmpty || props.Amend
+
+	// HashOf returns a cached value, so comparing the staged root against HEAD
+	// here avoids the full table delta walk for callers with nothing staged.
+	if !allowEmpty {
+		stagedHash, err := roots.Staged.HashOf()
+		if err != nil {
+			return nil, err
+		}
+		headHash, err := roots.Head.HashOf()
+		if err != nil {
+			return nil, err
+		}
+		if stagedHash == headHash {
+			if props.SkipEmpty {
+				return nil, nil
+			}
+			return nil, NothingStaged{}
+		}
+	}
+
 	stagedTables, notStaged, err := diff.GetStagedUnstagedTableDeltas(ctx, roots)
 	if err != nil {
 		return nil, err
@@ -106,7 +128,6 @@ func GetCommitStaged(
 	}
 
 	isEmpty := len(stagedTables) == 0 && len(stagedSchemas) == 0
-	allowEmpty := ws.MergeActive() || props.AllowEmpty || props.Amend
 
 	if isEmpty && props.SkipEmpty {
 		return nil, nil
@@ -161,12 +182,12 @@ func GetCommitStaged(
 		}
 	}
 
-	meta, err := datas.NewCommitMetaWithUserTS(props.Name, props.Email, props.Message, props.Date)
+	commitMeta, err := datas.NewCommitMetaWithAuthorCommitter(props.Author, props.Committer, props.Message)
 	if err != nil {
 		return nil, err
 	}
 
-	return db.NewPendingCommit(ctx, roots, mergeParents, props.Amend, meta)
+	return db.NewPendingCommit(ctx, roots, mergeParents, props.Amend, commitMeta)
 }
 
 // runCommitVerification runs the commit verification tests for the given test groups.

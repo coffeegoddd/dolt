@@ -64,7 +64,7 @@ func testGoodJSON(t *testing.T, getReader func(types.ValueReadWriter, schema.Sch
 	sch, err := schema.SchemaFromCols(colColl)
 	require.NoError(t, err)
 
-	sqlSch, err := sqlutil.FromDoltSchema("", "", sch)
+	sqlSch, err := sqlutil.FromDoltSchema(nil, "", "", sch)
 	require.NoError(t, err)
 
 	vrw := types.NewMemoryValueStore()
@@ -238,7 +238,7 @@ func newRow(sch schema.Schema, id int, first, last string) row.Row {
 		2: types.String(last),
 	}
 
-	r, err := row.New(types.Format_Default, sch, vals)
+	r, err := row.New(types.Format_DOLT, sch, vals)
 
 	if err != nil {
 		panic(err)

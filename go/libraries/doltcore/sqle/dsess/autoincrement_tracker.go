@@ -17,6 +17,7 @@ package dsess
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"math"
 	"strings"
@@ -41,7 +42,7 @@ type LockMode int64
 
 var (
 	LockMode_Traditional LockMode = 0
-	LockMode_Concurret   LockMode = 1
+	LockMode_Concurrent  LockMode = 1
 	LockMode_Interleaved LockMode = 2
 )
 
@@ -59,7 +60,18 @@ type AutoIncrementTracker struct {
 	// async initialization and block on the process completing.
 	cancelInit chan struct{}
 	dbName     string
-	lockMode   LockMode
+	// lockMode is the effective @@innodb_autoinc_lock_mode at the time of AutoIncrementTracker initialization.
+	// This value can only be set by config and cannot be changed in a running server.
+	lockMode LockMode
+}
+
+// currentLockMode returns the effective @@innodb_autoinc_lock_mode stored in global server vars
+func currentLockMode() LockMode {
+	_, i, _ := sql.SystemVariables.GetGlobal("innodb_autoinc_lock_mode")
+	if mode, ok := i.(int64); ok {
+		return LockMode(mode)
+	}
+	return LockMode_Interleaved
 }
 
 var _ globalstate.AutoIncrementTracker = &AutoIncrementTracker{}
@@ -99,13 +111,56 @@ func getGCSafepointController(ctx context.Context) *gcctx.GCSafepointController 
 	return gcctx.GetGCSafepointController(ctx)
 }
 
-func loadAutoIncValue(sequences *sync.Map, tableName string) uint64 {
+func loadAutoIncValue(sequences *sync.Map, tableName string) (current uint64, hasCurrent bool) {
 	tableName = strings.ToLower(tableName)
-	current, hasCurrent := sequences.Load(tableName)
+	stored, hasCurrent := sequences.Load(tableName)
 	if !hasCurrent {
-		return 0
+		return 0, false
 	}
-	return current.(uint64)
+	return stored.(uint64), true
+}
+
+func (a *AutoIncrementTracker) initializeTableAutoIncrement(ctx *sql.Context, tableName string) (uint64, bool, error) {
+	sess := DSessFromSess(ctx.Session)
+	ws, err := sess.WorkingSet(ctx, a.dbName)
+	if err != nil {
+		return 0, false, err
+	}
+
+	table, _, ok, err := doltdb.GetTableInsensitive(ctx, ws.WorkingRoot(), doltdb.TableName{Name: tableName})
+	if err != nil || !ok {
+		return 0, false, err
+	}
+
+	sch, err := table.GetSchema(ctx)
+	if err != nil {
+		return 0, false, err
+	}
+	if !schema.HasAutoIncrement(sch) {
+		return 0, false, nil
+	}
+
+	seq, err := table.GetAutoIncrementValue(ctx)
+	if err != nil {
+		return 0, false, err
+	}
+
+	table, err = a.deepSet(ctx, tableName, table, ws.Ref(), seq)
+	if err != nil {
+		return 0, false, err
+	}
+
+	seq, ok = loadAutoIncValue(a.sequences, tableName)
+	if ok {
+		return seq, true, nil
+	}
+
+	seq, err = table.GetAutoIncrementValue(ctx)
+	if err != nil {
+		return 0, false, err
+	}
+	a.sequences.Store(strings.ToLower(tableName), seq)
+	return seq, true, nil
 }
 
 func (a *AutoIncrementTracker) Close() {
@@ -113,17 +168,21 @@ func (a *AutoIncrementTracker) Close() {
 	<-a.init
 }
 
-// Current returns the next value to be generated in the auto increment sequence for the table named
+// Current returns the next value to be generated in the auto increment sequence for |tableName|.
 func (a *AutoIncrementTracker) Current(tableName string) (uint64, error) {
 	err := a.waitForInit()
 	if err != nil {
 		return 0, err
 	}
-	return loadAutoIncValue(a.sequences, tableName), nil
+	seq, ok := loadAutoIncValue(a.sequences, tableName)
+	if !ok {
+		return 0, nil
+	}
+	return seq, nil
 }
 
-// Next returns the next auto increment value for the table named using the provided value from an insert (which may
-// be null or 0, in which case it will be generated from the sequence).
+// Next returns the next auto increment value for |tbl| using |insertVal| from an insert. If |insertVal| is
+// null or 0, it is generated from the sequence.
 func (a *AutoIncrementTracker) Next(ctx *sql.Context, tbl string, insertVal interface{}) (uint64, error) {
 	err := a.waitForInit()
 	if err != nil {
@@ -137,12 +196,40 @@ func (a *AutoIncrementTracker) Next(ctx *sql.Context, tbl string, insertVal inte
 		return 0, err
 	}
 
+	// The read-modify-write of the sequence below must be atomic across concurrent inserters. In
+	// interleaved lock mode (the default) the engine holds no statement-level lock, so we take a
+	// short per-table lock here.
+	locked := false
 	if a.lockMode == LockMode_Interleaved {
 		release := a.mm.Lock(tbl)
 		defer release()
+		locked = true
 	}
 
-	curr := loadAutoIncValue(a.sequences, tbl)
+	curr, ok := loadAutoIncValue(a.sequences, tbl)
+	if !ok {
+		// Missing tracker state after initialization can happen when a running sql-server discovers a database
+		// restored after startup, so initialize it here.
+		if !locked {
+			if a.lockMode == LockMode_Interleaved {
+				release := a.mm.Lock(tbl)
+				defer release()
+				locked = true
+			}
+
+			curr, ok = loadAutoIncValue(a.sequences, tbl)
+		}
+
+		if !ok {
+			curr, ok, err = a.initializeTableAutoIncrement(ctx, tbl)
+			if err != nil {
+				return 0, err
+			}
+			if !ok {
+				return 0, fmt.Errorf("autoIncrementTracker: unable to find sequence for table %s", tbl)
+			}
+		}
+	}
 
 	if given == 0 {
 		// |given| is 0 or NULL
@@ -211,7 +298,10 @@ func (a *AutoIncrementTracker) Set(ctx *sql.Context, tableName string, table *do
 	release := a.mm.Lock(tableName)
 	defer release()
 
-	existing := loadAutoIncValue(a.sequences, tableName)
+	existing, ok := loadAutoIncValue(a.sequences, tableName)
+	if !ok {
+		existing = 0
+	}
 	if newAutoIncVal > existing && a.validateAutoIncrementBounds(ctx, tableName, newAutoIncVal, true) {
 		a.sequences.Store(tableName, newAutoIncVal)
 		return table.SetAutoIncrementValue(ctx, newAutoIncVal)
@@ -473,12 +563,10 @@ func (a *AutoIncrementTracker) AcquireTableLock(ctx *sql.Context, tableName stri
 		return nil, err
 	}
 
-	_, i, _ := sql.SystemVariables.GetGlobal("innodb_autoinc_lock_mode")
-	lockMode := LockMode(i.(int64))
-	if lockMode == LockMode_Interleaved {
+	if a.lockMode == LockMode_Interleaved {
+		// This shouldn't be possible, it's a serious programming error if it happens
 		panic("Attempted to acquire AutoInc lock for entire insert operation, but lock mode was set to Interleaved")
 	}
-	a.lockMode = lockMode
 	return a.mm.Lock(tableName), nil
 }
 
@@ -556,6 +644,7 @@ func (a *AutoIncrementTracker) initWithRoots(ctx context.Context, roots ...doltd
 		})
 	}
 
+	a.lockMode = currentLockMode()
 	a.initErr = eg.Wait()
 }
 

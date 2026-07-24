@@ -13,15 +13,31 @@ setup_dolt_repo() {
 
     PORT=$( definePORT )
     USER="dolt"
+    VERSION_STRING="$1"
     dolt sql -q "CREATE USER dolt@'%' IDENTIFIED BY ''; GRANT ALL ON *.* TO dolt@'%';"
-    dolt sql-server --host 0.0.0.0 --port="$PORT" --loglevel=trace &
+    if [[ -n "$VERSION_STRING" ]]; then
+        cat << YAML > config.yaml
+listener:
+  host: "0.0.0.0"
+  port: $PORT
+system_variables:
+  version: '$VERSION_STRING'
+YAML
+        echo "config" "$1"
+        dolt sql-server --host 0.0.0.0 --port="$PORT" --loglevel=trace --config config.yaml &
+    else
+        echo "config" "$1"
+        dolt sql-server --host 0.0.0.0 --port="$PORT" --loglevel=trace &
+    fi
     SERVER_PID=$!
     # Give the server a chance to start
     sleep 1
 }
 
 teardown_dolt_repo() {
-    kill $SERVER_PID
+    kill $SERVER_PID || :
+    wait $SERVER_PID || :
+    SERVER_PID=
     rm -rf $REPO_NAME
 }
 

@@ -67,10 +67,15 @@ func (k tableIndexesKey) String() string {
 
 type StatsController struct {
 	logger         *logrus.Logger
-	pro            *sqle.DoltDatabaseProvider
+	pro            dsess.DoltDatabaseProvider
 	bgThreads      *sql.BackgroundThreads
 	statsBackingDb filesys.Filesys
-	hdpEnv         *env.DoltEnv
+
+	// getUserHomeDir and dbLoadParams are captured from the DoltEnv at
+	// construction or InitDatabaseHook time. Once getUserHomeDir is set,
+	// neither field is overwritten.
+	getUserHomeDir env.HomeDirProvider
+	dbLoadParams   map[string]interface{}
 
 	dbFs map[string]filesys.Filesys
 
@@ -143,18 +148,33 @@ const defaultGcInterval = 24 * time.Hour
 
 func NewStatsController(logger *logrus.Logger, bgThreads *sql.BackgroundThreads, dEnv *env.DoltEnv) *StatsController {
 	return &StatsController{
-		mu:          sync.Mutex{},
-		logger:      logger,
-		gcInterval:  defaultGcInterval,
-		rateLimiter: newSimpleRateLimiter(defaultJobInterval),
-		Stats:       newRootStats(),
-		dbFs:        make(map[string]filesys.Filesys),
-		closed:      make(chan struct{}),
-		kv:          NewMemStats(),
-		hdpEnv:      dEnv,
-		bgThreads:   bgThreads,
-		genCnt:      atomic.Uint64{},
+		mu:             sync.Mutex{},
+		logger:         logger,
+		gcInterval:     defaultGcInterval,
+		rateLimiter:    newSimpleRateLimiter(defaultJobInterval),
+		Stats:          newRootStats(),
+		dbFs:           make(map[string]filesys.Filesys),
+		closed:         make(chan struct{}),
+		kv:             NewMemStats(),
+		getUserHomeDir: dEnvHomeDir(dEnv),
+		dbLoadParams:   dEnvLoadParams(dEnv),
+		bgThreads:      bgThreads,
+		genCnt:         atomic.Uint64{},
 	}
+}
+
+func dEnvHomeDir(dEnv *env.DoltEnv) env.HomeDirProvider {
+	if dEnv == nil {
+		return nil
+	}
+	return dEnv.GetUserHomeDir
+}
+
+func dEnvLoadParams(dEnv *env.DoltEnv) map[string]interface{} {
+	if dEnv == nil || len(dEnv.DBLoadParams) == 0 {
+		return nil
+	}
+	return maps.Clone(dEnv.DBLoadParams)
 }
 
 func (sc *StatsController) SetBackgroundThreads(bgThreads *sql.BackgroundThreads) {
@@ -274,8 +294,8 @@ func (sc *StatsController) descError(d string, err error) {
 	sc.logger.Debug(b.String())
 }
 
-func (sc *StatsController) GetTableStats(ctx *sql.Context, db string, table sql.Table) ([]sql.Statistic, error) {
-	key, err := sc.statsKey(ctx, db, table.Name())
+func (sc *StatsController) GetTableStats(ctx *sql.Context, sch, db string, table sql.Table) ([]sql.Statistic, error) {
+	key, err := sc.statsKey(ctx, sch, db, table.Name())
 	if err != nil {
 		return nil, err
 	}
@@ -329,11 +349,13 @@ func (sc *StatsController) AnalyzeTable(ctx *sql.Context, table sql.Table, dbNam
 	}
 
 	sc.mu.Lock()
-	// Add/override with new stats
 	for k, v := range newStats.stats {
 		sc.Stats.stats[k] = v
 		sc.Stats.hashes[k] = newStats.hashes[k]
 	}
+	// Ensure the background worker does not overwrite these results if it
+	// started computing before this ANALYZE TABLE ran.
+	sc.genCnt.Add(1)
 	sc.mu.Unlock()
 
 	return err
@@ -346,7 +368,8 @@ func (sc *StatsController) SetStats(ctx *sql.Context, s sql.Statistic) error {
 	if !ok {
 		return fmt.Errorf("expected *stats.Statistics, found %T", s)
 	}
-	key, err := sc.statsKey(ctx, ss.Qualifier().Db(), ss.Qualifier().Table())
+	qual := ss.Qualifier()
+	key, err := sc.statsKey(ctx, qual.Schema(), qual.Db(), qual.Table())
 	if err != nil {
 		return err
 	}
@@ -366,7 +389,7 @@ func (sc *StatsController) SetStats(ctx *sql.Context, s sql.Statistic) error {
 func (sc *StatsController) GetStats(ctx *sql.Context, qual sql.StatQualifier, cols []string) (sql.Statistic, bool) {
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
-	key, err := sc.statsKey(ctx, qual.Database, qual.Table())
+	key, err := sc.statsKey(ctx, qual.Schema(), qual.Db(), qual.Table())
 	if err != nil {
 		return nil, false
 	}
@@ -394,7 +417,7 @@ func (sc *StatsController) GetTableDoltStats(ctx *sql.Context, branch, db, schem
 }
 
 func (sc *StatsController) DropStats(ctx *sql.Context, qual sql.StatQualifier, cols []string) error {
-	key, err := sc.statsKey(ctx, qual.Database, qual.Table())
+	key, err := sc.statsKey(ctx, qual.Schema(), qual.Db(), qual.Table())
 	if err != nil {
 		return err
 	}
@@ -404,7 +427,7 @@ func (sc *StatsController) DropStats(ctx *sql.Context, qual sql.StatQualifier, c
 	return nil
 }
 
-func (sc *StatsController) DropDbStats(ctx *sql.Context, dbName string, flush bool) error {
+func (sc *StatsController) DropDbStats(ctx *sql.Context, sch, dbName string, flush bool) error {
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
 
@@ -423,7 +446,7 @@ func (sc *StatsController) DropDbStats(ctx *sql.Context, dbName string, flush bo
 	}
 
 	var deleteKeys []tableIndexesKey
-	for k, _ := range sc.Stats.stats {
+	for k := range sc.Stats.stats {
 		if strings.EqualFold(dbName, k.db) {
 			deleteKeys = append(deleteKeys, k)
 		}
@@ -434,7 +457,7 @@ func (sc *StatsController) DropDbStats(ctx *sql.Context, dbName string, flush bo
 	return nil
 }
 
-func (sc *StatsController) statsKey(ctx *sql.Context, dbName, table string) (tableIndexesKey, error) {
+func (sc *StatsController) statsKey(ctx *sql.Context, schema, dbName, table string) (tableIndexesKey, error) {
 	dSess := dsess.DSessFromSess(ctx.Session)
 	branch, err := dSess.GetBranch(ctx)
 	if err != nil {
@@ -444,12 +467,13 @@ func (sc *StatsController) statsKey(ctx *sql.Context, dbName, table string) (tab
 		db:     strings.ToLower(dbName),
 		branch: strings.ToLower(branch),
 		table:  strings.ToLower(table),
+		schema: strings.ToLower(schema),
 	}
 	return key, nil
 }
 
-func (sc *StatsController) RowCount(ctx *sql.Context, dbName string, table sql.Table) (uint64, error) {
-	key, err := sc.statsKey(ctx, dbName, table.Name())
+func (sc *StatsController) RowCount(ctx *sql.Context, schema, dbName string, table sql.Table) (uint64, error) {
+	key, err := sc.statsKey(ctx, schema, dbName, table.Name())
 	if err != nil {
 		return 0, err
 	}
@@ -463,8 +487,8 @@ func (sc *StatsController) RowCount(ctx *sql.Context, dbName string, table sql.T
 	return 0, nil
 }
 
-func (sc *StatsController) DataLength(ctx *sql.Context, dbName string, table sql.Table) (uint64, error) {
-	key, err := sc.statsKey(ctx, dbName, table.Name())
+func (sc *StatsController) DataLength(ctx *sql.Context, schema, dbName string, table sql.Table) (uint64, error) {
+	key, err := sc.statsKey(ctx, schema, dbName, table.Name())
 	if err != nil {
 		return 0, err
 	}
@@ -577,11 +601,9 @@ func (sc *StatsController) rm(fs filesys.Filesys) error {
 }
 
 func (sc *StatsController) initStorage(ctx context.Context, fs filesys.Filesys) (*prollyStats, error) {
-	if sc.hdpEnv == nil {
+	if sc.getUserHomeDir == nil {
 		return nil, fmt.Errorf("cannot initialize *prollKv, missing homeDirProvider")
 	}
-	params := make(map[string]interface{})
-	params[dbfactory.GRPCDialProviderParam] = env.NewGRPCDialProviderFromDoltEnv(sc.hdpEnv)
 
 	var urlPath string
 	u, err := earl.Parse(sc.pro.DbFactoryUrl())
@@ -599,8 +621,8 @@ func (sc *StatsController) initStorage(ctx context.Context, fs filesys.Filesys) 
 	// Build DB load params for the stats DoltDB. Always bypass the singleton cache:
 	// the stats controller owns the lifecycle of its DoltDB instances directly.
 	var dbLoadParams map[string]interface{}
-	if sc.hdpEnv != nil && len(sc.hdpEnv.DBLoadParams) > 0 {
-		dbLoadParams = maps.Clone(sc.hdpEnv.DBLoadParams)
+	if len(sc.dbLoadParams) > 0 {
+		dbLoadParams = maps.Clone(sc.dbLoadParams)
 	} else {
 		dbLoadParams = make(map[string]interface{})
 	}
@@ -615,21 +637,21 @@ func (sc *StatsController) initStorage(ctx context.Context, fs filesys.Filesys) 
 		}
 
 		// Use LoadWithoutDB so DB load params can be applied before any DB is opened.
-		dEnv = env.LoadWithoutDB(ctx, sc.hdpEnv.GetUserHomeDir, statsFs, urlPath, doltversion.Version)
+		dEnv = env.LoadWithoutDB(ctx, sc.getUserHomeDir, statsFs, urlPath, doltversion.Version)
 		dEnv.DBLoadParams = dbLoadParams
-		err = dEnv.InitRepo(ctx, types.Format_Default, "stats", "stats@stats.com", env.DefaultInitBranch)
+		err = dEnv.InitRepo(ctx, types.Format_DOLT, "stats", "stats@stats.com", env.DefaultInitBranch)
 		if err != nil {
 			return nil, err
 		}
 	} else if !isDir {
 		return nil, fmt.Errorf("file exists where the dolt stats directory should be")
 	} else {
-		dEnv = env.LoadWithoutDB(ctx, sc.hdpEnv.GetUserHomeDir, statsFs, "", doltversion.Version)
+		dEnv = env.LoadWithoutDB(ctx, sc.getUserHomeDir, statsFs, urlPath, doltversion.Version)
 		dEnv.DBLoadParams = dbLoadParams
-	}
-
-	if err := dEnv.LoadDoltDBWithParams(ctx, types.Format_Default, urlPath, statsFs, params); err != nil {
-		return nil, err
+		env.LoadDoltDB(ctx, dEnv)
+		if dEnv.DBLoadError != nil {
+			return nil, dEnv.DBLoadError
+		}
 	}
 
 	statsDdb := dEnv.DbData(ctx).Ddb

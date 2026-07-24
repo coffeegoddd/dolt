@@ -83,7 +83,7 @@ func prollyParentSecDiffFkConstraintViolations(
 	err = prolly.DiffMaps(ctx, preParentSecIdx, postParentSecIdx, considerAllRowsModified, func(ctx context.Context, diff tree.Diff) error {
 		switch diff.Type {
 		case tree.RemovedDiff, tree.ModifiedDiff:
-			k, hadNulls, err := makePartialKey(parentIdxKb, foreignKey.ReferencedTableColumns, postParent.Index, postParent.IndexSchema, val.Tuple(diff.Key), val.Tuple(diff.From), preParentSecIdx.Pool())
+			k, hadNulls, err := makePartialKey(ctx, parentIdxKb, foreignKey.ReferencedTableColumns, postParent.Index, postParent.IndexSchema, val.Tuple(diff.Key), val.Tuple(diff.From), preParentSecIdx.Pool())
 			if err != nil {
 				return err
 			}
@@ -178,7 +178,7 @@ func prollyParentPriDiffFkConstraintViolations(
 	err = prolly.DiffMaps(ctx, preParentRowData, postParentRowData, considerAllRowsModified, func(ctx context.Context, diff tree.Diff) error {
 		switch diff.Type {
 		case tree.RemovedDiff, tree.ModifiedDiff:
-			partialKey, hadNulls, err := makePartialKey(partialKB, foreignKey.ReferencedTableColumns, postParent.Index, postParent.Schema, val.Tuple(diff.Key), val.Tuple(diff.From), preParentRowData.Pool())
+			partialKey, hadNulls, err := makePartialKey(ctx, partialKB, foreignKey.ReferencedTableColumns, postParent.Index, postParent.Schema, val.Tuple(diff.Key), val.Tuple(diff.From), preParentRowData.Pool())
 			if err != nil {
 				return err
 			}
@@ -187,7 +187,10 @@ func prollyParentPriDiffFkConstraintViolations(
 				return nil
 			}
 
-			partialKeyRange := prolly.PrefixRange(ctx, partialKey, partialDesc)
+			partialKeyRange, err := prolly.PrefixRange(ctx, partialKey, partialDesc)
+			if err != nil {
+				return err
+			}
 			itr, err := postParentIndexData.IterRange(ctx, partialKeyRange)
 			if err != nil {
 				return err
@@ -268,6 +271,7 @@ func prollyChildPriDiffFkConstraintViolations(
 		case tree.AddedDiff, tree.ModifiedDiff:
 			k, v := val.Tuple(diff.Key), val.Tuple(diff.To)
 			parentLookupKey, hasNulls, err := makePartialKey(
+				ctx,
 				partialKB,
 				foreignKey.TableColumns,
 				postChild.Index,
@@ -315,7 +319,6 @@ func prollyChildSecDiffFkConstraintViolations(
 	postParent, postChild *constraintViolationsLoadedTable,
 	preChildSecIdx prolly.Map,
 	receiver FKViolationReceiver) error {
-
 	postChildRowData, err := durable.ProllyMapFromIndex(postChild.RowData)
 	if err != nil {
 		return err
@@ -401,11 +404,39 @@ func fkIdxKeyDescs(idx durable.Index, n int) (prolly.Map, *val.TupleDesc, *val.T
 func fkHandlersAreSerializationCompatible(keyDescA, keyDescB *val.TupleDesc) bool {
 	for i, handlerA := range keyDescA.Handlers {
 		handlerB := keyDescB.Handlers[i]
+		// Mixing dolt-native encoding with an extended encoding is by definition incompatible.
+		if (handlerA == nil) != (handlerB == nil) {
+			return false
+		}
+
 		if handlerA != nil && handlerB != nil && !handlerA.SerializationCompatible(handlerB) {
 			return false
 		}
+		// When both handlers are nil, check that the underlying native encodings are compatible.
+		// Different encodings may have different byte representations for the same logical value
+		// (e.g. StringEnc vs StringAdaptiveEnc). Adaptive encodings also require normalization
+		// because the same value may be stored inline in one context and out-of-band in another.
+		if handlerA == nil && handlerB == nil {
+			if !nativeEncodingsAreSerializationCompatible(keyDescA.Types[i].Enc, keyDescB.Types[i].Enc) {
+				return false
+			}
+		}
 	}
 	return true
+}
+
+// nativeEncodingsAreSerializationCompatible returns true if two fields with the given native
+// encodings (and no type handlers) produce identical byte representations for equal logical
+// values. Adaptive encodings (StringAdaptiveEnc, BytesAdaptiveEnc, etc.) return false even
+// when both sides share the same encoding, because equal values may be stored inline in one
+// tuple and out-of-band in another, resulting in different bytes.
+func nativeEncodingsAreSerializationCompatible(encA, encB val.Encoding) bool {
+	if encA != encB {
+		return false
+	}
+	// Adaptive encodings require normalization even when both sides use the same encoding,
+	// because a value may be stored inline in one tuple and out-of-band in another.
+	return !val.IsAdaptiveEncoding(encA)
 }
 
 // convertSerializedFkField converts a serialized foreign key value from one type handler to another.
@@ -489,7 +520,7 @@ func createCVForSecIdx(
 ) error {
 
 	// convert secondary idx entry to primary row key
-	primaryKey, err := primaryKeyFromSecondaryIndexRow(k, primaryKD, pri, tableSchema, indexSchema)
+	primaryKey, err := primaryKeyFromSecondaryIndexRow(ctx, k, primaryKD, pri, tableSchema, indexSchema)
 	if err != nil {
 		return err
 	}
@@ -509,7 +540,7 @@ func createCVForSecIdx(
 	return receiver.ProllyFKViolationFound(ctx, primaryKey, value)
 }
 
-func primaryKeyFromSecondaryIndexRow(secIndexRow val.Tuple, primaryKD *val.TupleDesc, pri prolly.Map, tableSchema schema.Schema, indexSchema schema.Schema) (val.Tuple, error) {
+func primaryKeyFromSecondaryIndexRow(ctx context.Context, secIndexRow val.Tuple, primaryKD *val.TupleDesc, pri prolly.Map, tableSchema schema.Schema, indexSchema schema.Schema) (val.Tuple, error) {
 	keyMap := makeOrdinalMappingForSchemas(indexSchema, tableSchema)
 
 	kb := val.NewTupleBuilder(primaryKD, pri.NodeStore())
@@ -518,7 +549,7 @@ func primaryKeyFromSecondaryIndexRow(secIndexRow val.Tuple, primaryKD *val.Tuple
 		kb.PutRaw(to, secIndexRow.GetField(from))
 	}
 
-	return kb.Build(pri.Pool())
+	return kb.Build(ctx, pri.Pool())
 }
 
 // makeOrdinalMappingForSchemas creates an ordinal mapping from one schema to another based on column names.
@@ -586,7 +617,7 @@ func createCVsForDanglingChildRows(
 		}
 
 		// convert secondary idx entry to primary row key
-		primaryIdxKey, err := primaryKeyFromSecondaryIndexRow(k, childPrimaryIdx.keyDesc, childPrimaryIdx.index, childPrimaryIdx.schema, childSecIdx.schema)
+		primaryIdxKey, err := primaryKeyFromSecondaryIndexRow(ctx, k, childPrimaryIdx.keyDesc, childPrimaryIdx.index, childPrimaryIdx.schema, childSecIdx.schema)
 		if err != nil {
 			return err
 		}
@@ -629,9 +660,25 @@ func convertKeyBetweenTypes(
 	pool pool.BuffPool,
 ) (val.Tuple, error) {
 	tb := val.NewTupleBuilder(toKeyDesc, ns)
-	for i, fromHandler := range fromKeyDesc.Handlers {
-		toHandler := toKeyDesc.Handlers[i]
-		serialized, err := convertSerializedFkField(ctx, toHandler, fromHandler, key.GetField(i))
+	for i := range toKeyDesc.Types {
+		var fromHandler, toHandler val.TupleTypeHandler
+		if i < len(fromKeyDesc.Handlers) {
+			fromHandler = fromKeyDesc.Handlers[i]
+		}
+		if i < len(toKeyDesc.Handlers) {
+			toHandler = toKeyDesc.Handlers[i]
+		}
+		field := key.GetField(i)
+
+		// If one or both handlers are nil, at least one field has a native encoding and needs special handling
+		if fromHandler == nil || toHandler == nil {
+			if err := convertNativeEncodedFkField(ctx, tb, ns, i, field, fromKeyDesc, toKeyDesc); err != nil {
+				return nil, err
+			}
+			continue
+		}
+
+		serialized, err := convertSerializedFkField(ctx, toHandler, fromHandler, field)
 		if err != nil {
 			return nil, err
 		}
@@ -640,17 +687,23 @@ func convertKeyBetweenTypes(
 		case val.AdaptiveEncodingTypeHandler:
 			switch toKeyDesc.Types[i].Enc {
 			case val.ExtendedAdaptiveEnc:
-				err := tb.PutAdaptiveExtendedFromInline(ctx, i, serialized)
-				if err != nil {
+				if err := tb.PutAdaptiveExtendedFromInline(ctx, i, serialized); err != nil {
 					return nil, err
 				}
 			case val.BytesAdaptiveEnc:
-				err := tb.PutAdaptiveExtendedFromInline(ctx, i, serialized)
-				if err != nil {
+				if err := tb.PutAdaptiveBytesFromInline(ctx, i, serialized); err != nil {
+					return nil, err
+				}
+			case val.StringAdaptiveEnc:
+				if err := tb.PutAdaptiveStringFromInline(ctx, i, string(serialized)); err != nil {
+					return nil, err
+				}
+			case val.JsonAdaptiveEnc:
+				if err := tb.PutAdaptiveJsonFromInline(ctx, i, serialized); err != nil {
 					return nil, err
 				}
 			default:
-				panic(fmt.Sprintf("unexpected encoding for adaptive type: %d", fromKeyDesc.Types[i].Enc))
+				panic(fmt.Sprintf("unexpected encoding for adaptive type: %d", toKeyDesc.Types[i].Enc))
 			}
 		default:
 			tb.PutRaw(i, serialized)
@@ -658,14 +711,144 @@ func convertKeyBetweenTypes(
 	}
 
 	var err error
-	key, err = tb.Build(pool)
+	key, err = tb.Build(ctx, pool)
 	if err != nil {
 		return nil, err
 	}
 	return key, nil
 }
 
-func makePartialKey(kb *val.TupleBuilder, tags []uint64, idxSch schema.Index, tblSch schema.Schema, k, v val.Tuple, pool pool.BuffPool) (val.Tuple, bool, error) {
+// convertNativeEncodedFkField converts a single FK field between encodings where at least one side uses a
+// Dolt-native encoding, writing the result directly into |tb| at position |i|.
+func convertNativeEncodedFkField(
+	ctx context.Context,
+	tb *val.TupleBuilder,
+	ns tree.NodeStore,
+	i int,
+	field []byte,
+	fromKeyDesc, toKeyDesc *val.TupleDesc,
+) error {
+	fromEnc := fromKeyDesc.Types[i].Enc
+	toEnc := toKeyDesc.Types[i].Enc
+	fromHandler := fromKeyDesc.Handlers[i]
+	toHandler := toKeyDesc.Handlers[i]
+
+	// Step 1: reduce the source to raw content bytes.  For extended sources we also
+	// hold on to the deserialised Go value so that an extended target can re-serialise
+	// it without a lossy round-trip through raw bytes.
+	var byteContent []byte
+	var fieldVal any
+
+	switch fromEnc {
+	case val.StringEnc:
+		if len(field) == 0 {
+			tb.PutRaw(i, nil)
+			return nil
+		}
+		byteContent = field[:len(field)-1]
+	case val.StringAdaptiveEnc, val.BytesAdaptiveEnc, val.JsonAdaptiveEnc, val.ExtendedAdaptiveEnc:
+		adaptiveVal := val.AdaptiveValue(field)
+		if adaptiveVal.IsNull() {
+			tb.PutRaw(i, nil)
+			return nil
+		}
+		if adaptiveVal.IsOutOfBand() {
+			handler := val.NewAdaptiveTypeHandler(ns, fromHandler)
+			inline, err := handler.ConvertToInline(ctx, adaptiveVal)
+			if err != nil {
+				return err
+			}
+			byteContent = inline[1:] // strip 0x00 inline header byte
+		} else {
+			byteContent = field[1:] // strip 0x00 inline header byte
+		}
+
+		if fromEnc == val.ExtendedAdaptiveEnc {
+			// byteContent above has already been stripped of the 0x00 inline header, so
+			// use the child (non-adaptive) handler to deserialise those raw payload bytes.
+			// AdaptiveEncodingTypeHandler.DeserializeValue expects the full adaptive value
+			// (with header) and will panic trying to parse the payload as an out-of-band
+			// reference.
+			deserializingHandler := fromHandler
+			if h, ok := fromHandler.(val.AdaptiveEncodingTypeHandler); ok {
+				deserializingHandler = h.ChildHandler()
+			}
+			v, err := deserializingHandler.DeserializeValue(ctx, byteContent)
+			if err != nil {
+				return err
+			}
+			fieldVal = v
+		}
+	case val.ExtendedEnc:
+		if len(field) == 0 {
+			tb.PutRaw(i, nil)
+			return nil
+		}
+		v, err := fromHandler.DeserializeValue(ctx, field)
+		if err != nil {
+			return err
+		}
+		fieldVal = v
+		byteContent = field
+	default:
+		// No known conversion; copy raw bytes as-is.
+		tb.PutRaw(i, field)
+		return nil
+	}
+
+	// Step 2: emit into the target encoding.  Native targets take |content| directly;
+	// extended targets need a Go value fed into |toHandler|.
+	switch toEnc {
+	case val.StringEnc:
+		return tb.PutString(i, string(byteContent))
+	case val.StringAdaptiveEnc:
+		return tb.PutAdaptiveStringFromInline(ctx, i, string(byteContent))
+	case val.BytesAdaptiveEnc:
+		return tb.PutAdaptiveBytesFromInline(ctx, i, byteContent)
+	case val.JsonAdaptiveEnc:
+		return tb.PutAdaptiveJsonFromInline(ctx, i, byteContent)
+	case val.ExtendedAdaptiveEnc, val.ExtendedEnc:
+		v := fieldVal
+		if v == nil {
+			// Source was native; lift raw content to the Go shape |toHandler| expects.
+			v = bytesToGoValue(fromEnc, byteContent)
+		}
+		// For an adaptive target we need the child (non-adaptive) handler's serialisation
+		// bytes: PutAdaptiveExtendedFromInline prepends the 0x00 inline marker itself, and
+		// AdaptiveEncodingTypeHandler.SerializeValue would also prepend one, producing a
+		// double-header inline value that fails to compare against stored parent keys.
+		serializingHandler := toHandler
+		if h, ok := toHandler.(val.AdaptiveEncodingTypeHandler); ok {
+			serializingHandler = h.ChildHandler()
+		}
+		serialized, err := serializingHandler.SerializeValue(ctx, v)
+		if err != nil {
+			return err
+		}
+		if toEnc == val.ExtendedAdaptiveEnc {
+			return tb.PutAdaptiveExtendedFromInline(ctx, i, serialized)
+		}
+		tb.PutRaw(i, serialized)
+		return nil
+	default:
+		// Unsupported target encoding; copy raw bytes as-is.
+		tb.PutRaw(i, field)
+		return nil
+	}
+}
+
+// bytesToGoValue lifts raw content bytes to the Go value shape an extended type
+// handler expects.  BytesAdaptiveEnc sources hold []byte payloads; every other native
+// encoding we handle here (StringEnc, StringAdaptiveEnc, JsonAdaptiveEnc) holds a UTF-8
+// string.
+func bytesToGoValue(sourceEnc val.Encoding, content []byte) any {
+	if sourceEnc == val.BytesAdaptiveEnc {
+		return content
+	}
+	return string(content)
+}
+
+func makePartialKey(ctx context.Context, kb *val.TupleBuilder, tags []uint64, idxSch schema.Index, tblSch schema.Schema, k, v val.Tuple, pool pool.BuffPool) (val.Tuple, bool, error) {
 	// Possible that the parent index (idxSch) is longer than the partial key (tags).
 	if idxSch.Name() != "" && len(idxSch.IndexedColumnTags()) <= len(tags) {
 		tags = idxSch.IndexedColumnTags()
@@ -690,7 +873,7 @@ func makePartialKey(kb *val.TupleBuilder, tags []uint64, idxSch schema.Index, tb
 		}
 	}
 
-	tup, err := kb.Build(pool)
+	tup, err := kb.Build(ctx, pool)
 	return tup, false, err
 }
 

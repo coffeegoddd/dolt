@@ -79,10 +79,16 @@ type DoltDatabaseProvider struct {
 	// when accessed.
 	deletingDatabases map[string]struct{}
 
-	// remoteDbs caches remote DoltDB instances by URL so that repeated push calls
-	// to the same remote reuse the store (and its already-opened table chunk sources)
-	// instead of re-opening every table file from the blobstore each time.
-	remoteDbs map[string]*doltdb.DoltDB
+	// creatingDatabases reserves names for clones fetching data from a remote.
+	// CloneDatabaseFromRemote drops the provider lock for that network fetch, so
+	// it records the name here to keep concurrent CREATE DATABASE / dolt_clone /
+	// undrop of the same name serialized. Names are normalized with
+	// formatDbMapKeyName, like p.databases (Dolt names are case-insensitive).
+	//
+	// Unlike deletingDatabases, this does not gate enumeration: enumeration only
+	// ever reads the in-memory p.databases map at runtime, so an in-progress
+	// clone's on-disk directory is simply invisible until it registers.
+	creatingDatabases map[string]struct{}
 
 	txLocks keymutex.Keymutex
 
@@ -90,6 +96,31 @@ type DoltDatabaseProvider struct {
 	dbFactoryUrl      string
 	DropDatabaseHooks []DropDatabaseHook
 	InitDatabaseHooks []InitDatabaseHook
+	gitRemotes        map[string]*doltdb.DoltDB
+	gitRemotesMu      *sync.Mutex
+}
+
+// ProviderFactory creates a sql.DatabaseProvider for use as the engine's analyzer catalog
+// provider.
+type ProviderFactory interface {
+	NewProvider(defaultBranch string, fs filesys.Filesys, databases []dsess.SqlDatabase, locations []filesys.Filesys, overrides sql.EngineOverrides) (sql.DatabaseProvider, error)
+}
+
+// DoltProviderUnwrapper is an optional interface for sql.DatabaseProvider implementations
+// that wrap a *DoltDatabaseProvider. NewSqlEngine uses it to access the underlying
+// provider for Dolt-specific configuration (hooks, dialer, etc.) that is not part of
+// the sql.DatabaseProvider interface.
+type DoltProviderUnwrapper interface {
+	UnderlyingDoltProvider() *DoltDatabaseProvider
+}
+
+// DoltProviderFactory is the default ProviderFactory used by Dolt.
+type DoltProviderFactory struct{}
+
+var _ ProviderFactory = DoltProviderFactory{}
+
+func (DoltProviderFactory) NewProvider(defaultBranch string, fs filesys.Filesys, databases []dsess.SqlDatabase, locations []filesys.Filesys, overrides sql.EngineOverrides) (sql.DatabaseProvider, error) {
+	return NewDoltDatabaseProviderWithDatabases(defaultBranch, fs, databases, locations, overrides)
 }
 
 type remoteDialerWithGitCacheRoot struct {
@@ -111,6 +142,7 @@ var _ sql.CollatedDatabaseProvider = (*DoltDatabaseProvider)(nil)
 var _ sql.ExternalStoredProcedureProvider = (*DoltDatabaseProvider)(nil)
 var _ sql.TableFunctionProvider = (*DoltDatabaseProvider)(nil)
 var _ dsess.DoltDatabaseProvider = (*DoltDatabaseProvider)(nil)
+var _ DatabaseHookRegistrar = (*DoltDatabaseProvider)(nil)
 
 func (p *DoltDatabaseProvider) DefaultBranch() string {
 	return p.defaultBranch
@@ -187,6 +219,7 @@ func NewDoltDatabaseProviderWithDatabases(defaultBranch string, fs filesys.Files
 		dbLocations:            dbLocations,
 		databases:              dbs,
 		deletingDatabases:      make(map[string]struct{}),
+		creatingDatabases:      make(map[string]struct{}),
 		functions:              funcs,
 		tableFunctions:         tableFuncs,
 		externalProcedures:     externalProcedures,
@@ -197,8 +230,9 @@ func NewDoltDatabaseProviderWithDatabases(defaultBranch string, fs filesys.Files
 		isStandby:              new(bool),
 		droppedDatabaseManager: newDroppedDatabaseManager(fs),
 		overrides:              overrides,
-		remoteDbs:              make(map[string]*doltdb.DoltDB),
 		txLocks:                keymutex.NewMapped(),
+		gitRemotes:             map[string]*doltdb.DoltDB{},
+		gitRemotesMu:           &sync.Mutex{},
 	}, nil
 }
 
@@ -226,11 +260,9 @@ func (p *DoltDatabaseProvider) WithDbFactoryUrl(url string) *DoltDatabaseProvide
 	return &cp
 }
 
-// WithRemoteDialer returns a copy of this provider with the dialer provided
-func (p *DoltDatabaseProvider) WithRemoteDialer(provider dbfactory.GRPCDialProvider) *DoltDatabaseProvider {
-	cp := *p
-	cp.remoteDialer = provider
-	return &cp
+// SetRemoteDialer sets the remote dialer on this provider in place and returns it.
+func (p *DoltDatabaseProvider) SetRemoteDialer(provider dbfactory.GRPCDialProvider) {
+	p.remoteDialer = provider
 }
 
 // SetDBLoadParams sets optional DB load params for newly created / registered databases. The provided map is cloned.
@@ -313,19 +345,13 @@ func (p *DoltDatabaseProvider) Close() {
 		}
 	}
 
-	// Close cached remote databases.
-	var remoteDbs []*doltdb.DoltDB
-	func() {
-		p.mu.RLock()
-		defer p.mu.RUnlock()
-		remoteDbs = make([]*doltdb.DoltDB, 0, len(p.remoteDbs))
-		for _, rdb := range p.remoteDbs {
-			remoteDbs = append(remoteDbs, rdb)
-		}
-	}()
-	for _, rdb := range remoteDbs {
-		_ = rdb.Close()
-	}
+}
+
+func (p *DoltDatabaseProvider) Teardown(ctx context.Context) {
+	dbfactory.TeardownGitRemotes(ctx)
+	p.gitRemotesMu.Lock()
+	p.gitRemotes = map[string]*doltdb.DoltDB{}
+	p.gitRemotesMu.Unlock()
 }
 
 // Installs an InitDatabaseHook which configures new databases--those
@@ -571,7 +597,7 @@ func (p *DoltDatabaseProvider) allRevisionDbs(ctx *sql.Context, db dsess.SqlData
 	return revDbs, nil
 }
 
-func (p *DoltDatabaseProvider) GetRemoteDB(ctx context.Context, format *types.NomsBinFormat, r env.Remote, withCaching bool) (*doltdb.DoltDB, error) {
+func (p *DoltDatabaseProvider) GetRemoteDB(ctx context.Context, format *types.NomsBinFormat, r env.Remote) (*doltdb.DoltDB, error) {
 	// For git remotes, thread through the initiating database's repo root so git caches can be located under
 	// `<repoRoot>/.dolt/...` instead of a user-global cache dir.
 	dialer := p.remoteDialer
@@ -588,46 +614,38 @@ func (p *DoltDatabaseProvider) GetRemoteDB(ctx context.Context, format *types.No
 		}
 	}
 
-	if withCaching {
-		// Only cache git-backed remote DBs. Other remote types (file://, aws, etc.)
-		// register their underlying NBS in a global singleton cache that is closed
-		// separately by CloseAllLocalDatabases(). Caching those here would cause a
-		// double-close panic on process exit.
-		isGitRemote := strings.HasPrefix(strings.ToLower(r.Url), "git+")
-		if isGitRemote {
-			cached := func() *doltdb.DoltDB {
-				p.mu.RLock()
-				defer p.mu.RUnlock()
-				return p.remoteDbs[r.Url]
-			}()
-			if cached != nil {
-				return cached, nil
-			}
-		}
+	key := strings.ToLower(r.Url)
+	isGit := strings.HasPrefix(key, "git+")
 
-		remoteDB, err := r.GetRemoteDB(ctx, format, dialer)
-		if err != nil {
-			return nil, err
+	if isGit {
+		p.gitRemotesMu.Lock()
+		cached, ok := p.gitRemotes[key]
+		p.gitRemotesMu.Unlock()
+		if ok {
+			return cached, nil
 		}
-
-		if isGitRemote {
-			cached := func() *doltdb.DoltDB {
-				p.mu.Lock()
-				defer p.mu.Unlock()
-				if existing, ok := p.remoteDbs[r.Url]; ok {
-					return existing
-				}
-				p.remoteDbs[r.Url] = remoteDB
-				return nil
-			}()
-			if cached != nil {
-				_ = remoteDB.Close()
-				return cached, nil
-			}
-		}
-		return remoteDB, nil
 	}
-	return r.GetRemoteDBWithoutCaching(ctx, format, dialer)
+
+	ddb, err := r.GetRemoteDBWithoutCaching(ctx, format, dialer)
+	if err != nil {
+		return nil, err
+	}
+
+	if isGit {
+		ddb = func() *doltdb.DoltDB {
+			p.gitRemotesMu.Lock()
+			defer p.gitRemotesMu.Unlock()
+			if existing, ok := p.gitRemotes[key]; ok {
+				// Lost a race; both wrap the same underlying datas.Database, so
+				// dropping ours is safe.
+				_ = ddb.Close()
+				return existing
+			}
+			p.gitRemotes[key] = ddb
+			return ddb
+		}()
+	}
+	return ddb, nil
 }
 
 func (p *DoltDatabaseProvider) CreateDatabase(ctx *sql.Context, name string) error {
@@ -655,6 +673,12 @@ func commitTransaction(ctx *sql.Context, dSess *dsess.DoltSession, rsc *doltdb.R
 	}
 
 	return nil
+}
+
+var ErrIncompleteDatabaseDir = errors.New("incomplete database directory from an interrupted create already exists; remove the directory and try again")
+
+func NewErrIncompleteDatabaseDir(db string) error {
+	return fmt.Errorf("cannot create database %s: %w", db, ErrIncompleteDatabaseDir)
 }
 
 func (p *DoltDatabaseProvider) CreateCollatedDatabase(ctx *sql.Context, name string, collation sql.CollationID) (err error) {
@@ -685,14 +709,8 @@ func (p *DoltDatabaseProvider) CreateCollatedDatabase(ctx *sql.Context, name str
 		}
 	}()
 
-	if _, ok := p.deletingDatabases[name]; ok {
-		return sql.ErrDatabaseExists.New(name)
-	}
-	exists, isDir := p.fs.Exists(name)
-	if exists && isDir {
-		return sql.ErrDatabaseExists.New(name)
-	} else if exists {
-		return fmt.Errorf("Cannot create DB, file exists at %s", name)
+	if err = p.checkDatabaseNameAvailableLocked(name, true /* checkDisk */); err != nil {
+		return err
 	}
 
 	err = p.fs.MkDirs(name)
@@ -712,12 +730,17 @@ func (p *DoltDatabaseProvider) CreateCollatedDatabase(ctx *sql.Context, name str
 		return err
 	}
 
+	err = dbfactory.MarkDatabaseInProgress(newFs)
+	if err != nil {
+		return err
+	}
+
 	// TODO: fill in version appropriately
 	// Use LoadWithoutDB so we can apply db-load params before any DB is opened.
 	newEnv := env.LoadWithoutDB(ctx, env.GetCurrentUserHomeDir, newFs, p.dbFactoryUrl, "TODO")
 	p.applyDBLoadParamsToEnv(newEnv)
 
-	newDbStorageFormat := types.Format_Default
+	newDbStorageFormat := types.Format_DOLT
 	err = newEnv.InitRepo(ctx, newDbStorageFormat, sess.Username(), sess.Email(), p.defaultBranch)
 	if err != nil {
 		return err
@@ -783,6 +806,11 @@ func (p *DoltDatabaseProvider) CreateCollatedDatabase(ctx *sql.Context, name str
 		updatedSchemas = true
 	}
 
+	err = dbfactory.ClearDatabaseInProgress(newFs)
+	if err != nil {
+		return err
+	}
+
 	err = p.registerNewDatabase(ctx, name, newEnv)
 	if err != nil {
 		return err
@@ -812,16 +840,11 @@ func (p *DoltDatabaseProvider) CreateCollatedDatabase(ctx *sql.Context, name str
 			return fmt.Errorf("unable to get roots for database %s", name)
 		}
 
-		t := ctx.QueryTime()
-		userName := ctx.Client().User
-		userEmail := fmt.Sprintf("%s@%s", ctx.Client().User, ctx.Client().Address)
-
-		pendingCommit, err := sess.NewPendingCommit(ctx, name, roots, actions.CommitStagedProps{
-			Message: "CREATE DATABASE",
-			Date:    t,
-			Name:    userName,
-			Email:   userEmail,
-		})
+		commitStagedProps, _, err := dsess.NewCommitStagedProps(ctx, "CREATE DATABASE")
+		if err != nil {
+			return err
+		}
+		pendingCommit, err := sess.NewPendingCommit(ctx, name, roots, commitStagedProps)
 		if err != nil {
 			return err
 		}
@@ -846,6 +869,15 @@ func validateDBName(dbName string) error {
 
 type InitDatabaseHook func(ctx *sql.Context, pro *DoltDatabaseProvider, name string, env *env.DoltEnv, db dsess.SqlDatabase) error
 type DropDatabaseHook func(ctx *sql.Context, name string)
+
+// DatabaseHookRegistrar is implemented by database providers that support registering
+// hooks for database init and drop lifecycle events.
+type DatabaseHookRegistrar interface {
+	// AddInitDatabaseHook adds an InitDatabaseHook that runs whenever a database is created.
+	AddInitDatabaseHook(InitDatabaseHook)
+	// AddDropDatabaseHook adds a DropDatabaseHook that runs whenever a database is dropped.
+	AddDropDatabaseHook(DropDatabaseHook)
+}
 
 // NewConfigureReplicationDatabaseHook sets up the hooks to push to a remote to replicate a newly created database.
 //
@@ -906,34 +938,28 @@ func NewConfigureReplicationDatabaseHook(bThreads *sql.BackgroundThreads, ctxF f
 	}
 }
 
-// CloneDatabaseFromRemote implements DoltDatabaseProvider interface
+// CloneDatabaseFromRemote implements DoltDatabaseProvider interface.
 //
-// TODO: This holds the database provider lock across the entire duration of
-// the clone, which is much too long to hold this lock.
+// The provider lock is not held across the clone's network fetch, which can run
+// for an arbitrarily long time. Instead we reserve the name under the lock,
+// release it for the fetch, then re-acquire it only to register the finished
+// database.
 func (p *DoltDatabaseProvider) CloneDatabaseFromRemote(
 	ctx *sql.Context,
 	dbName, branch, remoteName, remoteUrl string,
 	depth int,
 	remoteParams map[string]string,
 ) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	if _, ok := p.deletingDatabases[dbName]; ok {
-		return sql.ErrDatabaseExists.New(dbName)
+	if err := p.reserveCreatingDatabase(dbName); err != nil {
+		return err
 	}
-
-	exists, isDir := p.fs.Exists(dbName)
-	if exists && isDir {
-		return sql.ErrDatabaseExists.New(dbName)
-	} else if exists {
-		return fmt.Errorf("cannot create DB, file exists at %s", dbName)
-	}
+	defer p.releaseCreatingDatabase(dbName)
 
 	err := p.cloneDatabaseFromRemote(ctx, dbName, remoteName, branch, remoteUrl, depth, remoteParams)
 	if err != nil {
 		// Make a best effort to clean up any artifacts on disk from a failed clone
-		// before we return the error
+		// before we return the error. The name reservation is still held, so
+		// nothing else can be using this directory.
 		exists, _ := p.fs.Exists(dbName)
 		if exists {
 			deleteErr := p.fs.Delete(dbName, true)
@@ -946,6 +972,62 @@ func (p *DoltDatabaseProvider) CloneDatabaseFromRemote(
 	}
 
 	return nil
+}
+
+// checkDatabaseNameAvailableLocked verifies that |name| is free for a new
+// database, returning an error if it is already taken by a live, deleting, or
+// creating database and nil if it is available. It must be called with p.mu
+// held. Names are normalized with formatDbMapKeyName because Dolt database names
+// are case-insensitive.
+//
+// When |checkDisk| is true the on-disk directory is also checked; creation paths
+// pass true, while undrop (which restores from the stash) passes false.
+func (p *DoltDatabaseProvider) checkDatabaseNameAvailableLocked(name string, checkDisk bool) error {
+	key := formatDbMapKeyName(name)
+	if _, ok := p.deletingDatabases[key]; ok {
+		return sql.ErrDatabaseExists.New(name)
+	}
+	if _, ok := p.creatingDatabases[key]; ok {
+		return sql.ErrDatabaseExists.New(name)
+	}
+	if checkDisk {
+		exists, isDir := p.fs.Exists(name)
+		if exists && isDir {
+			// A directory left behind by an interrupted create/clone carries an
+			// in-progress marker; surface a clearer error than "already exists".
+			if subFs, ferr := p.fs.WithWorkingDir(name); ferr == nil && env.IsIncompleteDatabaseDir(subFs) {
+				return NewErrIncompleteDatabaseDir(name)
+			}
+			return sql.ErrDatabaseExists.New(name)
+		} else if exists {
+			return fmt.Errorf("cannot create DB, file exists at %s", name)
+		}
+	}
+	return nil
+}
+
+// reserveCreatingDatabase takes the provider write lock to verify |dbName| is
+// available and records it in p.creatingDatabases, reserving the name for an
+// in-progress clone. The caller MUST call releaseCreatingDatabase once the clone
+// has finished (success or failure).
+func (p *DoltDatabaseProvider) reserveCreatingDatabase(dbName string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if err := p.checkDatabaseNameAvailableLocked(dbName, true /* checkDisk */); err != nil {
+		return err
+	}
+
+	p.creatingDatabases[formatDbMapKeyName(dbName)] = struct{}{}
+	return nil
+}
+
+// releaseCreatingDatabase removes the reservation recorded by
+// reserveCreatingDatabase.
+func (p *DoltDatabaseProvider) releaseCreatingDatabase(dbName string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delete(p.creatingDatabases, formatDbMapKeyName(dbName))
 }
 
 // cloneDatabaseFromRemote encapsulates the inner logic for cloning a database so that if any error
@@ -967,7 +1049,7 @@ func (p *DoltDatabaseProvider) cloneDatabaseFromRemote(
 	if err != nil {
 		return err
 	}
-	srcDB, err := r.GetRemoteDB(ctx, types.Format_Default, remoteDialerWithGitCacheRoot{GRPCDialProvider: p.remoteDialer, root: destRoot})
+	srcDB, err := r.GetRemoteDB(ctx, types.Format_DOLT, remoteDialerWithGitCacheRoot{GRPCDialProvider: p.remoteDialer, root: destRoot})
 	if err != nil {
 		return err
 	}
@@ -990,6 +1072,14 @@ func (p *DoltDatabaseProvider) cloneDatabaseFromRemote(
 		Remote: remoteName,
 	})
 
+	// Now that the fetch is complete, clear the in-progress marker and take the
+	// lock to register the database. registerNewDatabase requires the lock held.
+	if err := dbfactory.ClearDatabaseInProgress(dEnv.FS); err != nil {
+		return err
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	return p.registerNewDatabase(ctx, dbName, dEnv)
 }
 
@@ -1121,8 +1211,8 @@ func (p *DoltDatabaseProvider) UndropDatabase(ctx *sql.Context, name string) (er
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	if _, ok := p.deletingDatabases[name]; ok {
-		return sql.ErrDatabaseExists.New(name)
+	if err = p.checkDatabaseNameAvailableLocked(name, false /* checkDisk */); err != nil {
+		return err
 	}
 
 	newFs, exactCaseName, err := p.droppedDatabaseManager.UndropDatabase(ctx, name)
@@ -1685,7 +1775,7 @@ func (p *DoltDatabaseProvider) SessionDatabase(ctx *sql.Context, name string) (d
 }
 
 // Function implements the FunctionProvider interface
-func (p *DoltDatabaseProvider) Function(_ *sql.Context, name string) (sql.Function, bool) {
+func (p *DoltDatabaseProvider) Function(_ *sql.Context, schema, name string) (sql.Function, bool) {
 	fn, ok := p.functions[strings.ToLower(name)]
 	if !ok {
 		return nil, false

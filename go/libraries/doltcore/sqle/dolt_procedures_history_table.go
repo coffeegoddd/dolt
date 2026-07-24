@@ -57,7 +57,7 @@ func (dpht *doltProceduresHistoryTable) String() string {
 }
 
 // Schema implements sql.Table
-func (dpht *doltProceduresHistoryTable) Schema() sql.Schema {
+func (dpht *doltProceduresHistoryTable) Schema(ctx *sql.Context) sql.Schema {
 	// Base schema from dolt_procedures table
 	baseSch := sql.Schema{
 		&sql.Column{Name: doltdb.ProceduresTableNameCol, Type: types.MustCreateString(sqltypes.VarChar, 64, sql.Collation_utf8mb4_0900_ai_ci), Nullable: false, PrimaryKey: true, Source: dpht.name},
@@ -104,9 +104,9 @@ func (dpht *doltProceduresHistoryTable) PartitionRows(ctx *sql.Context, partitio
 }
 
 // PrimaryKeySchema implements sql.PrimaryKeyTable
-func (dpht *doltProceduresHistoryTable) PrimaryKeySchema() sql.PrimaryKeySchema {
+func (dpht *doltProceduresHistoryTable) PrimaryKeySchema(ctx *sql.Context) sql.PrimaryKeySchema {
 	return sql.PrimaryKeySchema{
-		Schema:     dpht.Schema(),
+		Schema:     dpht.Schema(ctx),
 		PkOrdinals: []int{0, 5}, // name, commit_hash
 	}
 }
@@ -125,7 +125,7 @@ type doltProceduresHistoryRowIter struct {
 func (dphri *doltProceduresHistoryRowIter) Next(ctx *sql.Context) (sql.Row, error) {
 	if dphri.rows == nil {
 		// Initialize rows from the commit's dolt_procedures table
-		err := dphri.loadRows()
+		err := dphri.loadRows(ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -141,7 +141,7 @@ func (dphri *doltProceduresHistoryRowIter) Next(ctx *sql.Context) (sql.Row, erro
 	return row, nil
 }
 
-func (dphri *doltProceduresHistoryRowIter) loadRows() error {
+func (dphri *doltProceduresHistoryRowIter) loadRows(ctx *sql.Context) error {
 	root, err := dphri.commit.GetRootValue(dphri.ctx)
 	if err != nil {
 		return err
@@ -170,8 +170,8 @@ func (dphri *doltProceduresHistoryRowIter) loadRows() error {
 
 	// Convert commit metadata to SQL values
 	commitHashStr := commitHash.String()
-	committerStr := commitMeta.Name + " <" + commitMeta.Email + ">"
-	commitDate := commitMeta.Time()
+	committerStr := commitMeta.Committer.Name + " <" + commitMeta.Committer.Email + ">"
+	commitDate := commitMeta.Committer.Date.Time()
 
 	// Get the schema
 	sch, err := tbl.GetSchema(dphri.ctx)
@@ -180,7 +180,7 @@ func (dphri *doltProceduresHistoryRowIter) loadRows() error {
 	}
 
 	// Create a DoltTable using the database reference we now have
-	doltTable, err := NewDoltTable(doltdb.ProceduresTableName, sch, tbl, dphri.history.db, editor.Options{})
+	doltTable, err := NewDoltTable(ctx, doltdb.ProceduresTableName, sch, tbl, dphri.history.db, editor.Options{})
 	if err != nil {
 		return err
 	}

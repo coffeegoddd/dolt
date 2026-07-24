@@ -19,6 +19,7 @@ import (
 
 	"github.com/dolthub/go-mysql-server/sql"
 
+	"github.com/dolthub/dolt/go/libraries/doltcore/branch_control"
 	"github.com/dolthub/dolt/go/libraries/doltcore/doltdb"
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/dsess"
 	"github.com/dolthub/dolt/go/libraries/doltcore/sqle/index"
@@ -50,7 +51,7 @@ func (bst *UserSpaceSystemTable) String() string {
 	return bst.tableName.Name
 }
 
-func (bst *UserSpaceSystemTable) Schema() sql.Schema {
+func (bst *UserSpaceSystemTable) Schema(ctx *sql.Context) sql.Schema {
 	return bst.schema
 }
 
@@ -169,7 +170,7 @@ func (bstw *backedSystemTableWriter) Delete(ctx *sql.Context, r sql.Row) error {
 // StatementBegin is called before the first operation of a statement. Integrators should mark the state of the data
 // in some way that it may be returned to in the case of an error.
 func (bstw *backedSystemTableWriter) StatementBegin(ctx *sql.Context) {
-	prevHash, tableWriter, err := createWriteableSystemTable(ctx, bstw.bst.tableName, bstw.bst.Schema())
+	prevHash, tableWriter, err := createWriteableSystemTable(ctx, bstw.bst.tableName, bstw.bst.Schema(ctx))
 	if err != nil {
 		bstw.errDuringStatementBegin = err
 		return
@@ -207,6 +208,13 @@ func (bstw backedSystemTableWriter) Close(ctx *sql.Context) error {
 // CreateWriteableSystemTable is a helper function that creates a writeable system table (dolt_ignore, dolt_docs...) if it does not exist
 // Then returns the hash of the previous working root, and a TableWriter.
 func createWriteableSystemTable(ctx *sql.Context, tblName doltdb.TableName, tblSchema sql.Schema) (*hash.Hash, dsess.TableWriter, error) {
+	// Writes to user-space system tables (dolt_docs, dolt_ignore,
+	// dolt_query_catalog, dolt_nonlocal_tables, dolt_tests) modify the
+	// current branch's working set, so the same Permissions_Write gate that
+	// covers regular table writes applies.
+	if err := branch_control.CheckAccess(ctx, branch_control.Permissions_Write); err != nil {
+		return nil, nil, err
+	}
 	dbName := ctx.GetCurrentDatabase()
 	dSess := dsess.DSessFromSess(ctx.Session)
 
@@ -263,7 +271,7 @@ func createWriteableSystemTable(ctx *sql.Context, tblName doltdb.TableName, tblS
 
 	var tableWriter dsess.TableWriter
 	if ws := dbState.WriteSession(); ws != nil {
-		tableWriter, err = ws.GetTableWriter(ctx, tblName, dbName, dSess.SetWorkingRoot, false)
+		tableWriter, err = ws.GetTableWriter(ctx, tblName)
 		if err != nil {
 			return nil, nil, err
 		}

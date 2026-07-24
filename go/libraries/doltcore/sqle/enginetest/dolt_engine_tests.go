@@ -90,12 +90,12 @@ func (tcc *testCommitClock) Now() time.Time {
 }
 
 func installTestCommitClock(tcc *testCommitClock) func() {
-	oldNowFunc := datas.CommitterDate
+	oldNowFunc := datas.CommitNow
 	oldCommitLoc := datas.CommitLoc
-	datas.CommitterDate = tcc.Now
+	datas.CommitNow = tcc.Now
 	datas.CommitLoc = time.UTC
 	return func() {
-		datas.CommitterDate = oldNowFunc
+		datas.CommitNow = oldNowFunc
 		datas.CommitLoc = oldCommitLoc
 	}
 }
@@ -152,7 +152,7 @@ func testAutoIncrementTrackerWithLockMode(t *testing.T, harness DoltEnginetestHa
 		require.NoError(t, err)
 
 		var triggerNode *plan.TriggerExecutor
-		transform.Node(root, func(n sql.Node) (sql.Node, transform.TreeIdentity, error) {
+		transform.Node(ctx, root, func(ctx *sql.Context, n sql.Node) (sql.Node, transform.TreeIdentity, error) {
 			if triggerNode != nil {
 				return n, transform.SameTree, nil
 			}
@@ -348,10 +348,20 @@ func RunBigBlobsTest(t *testing.T, h DoltEnginetestHarness) {
 
 func RunTestAdaptiveEncoding(t *testing.T, h DoltEnginetestHarness, columnType AdaptiveEncodingTestColumnType, testPurpose AdaptiveEncodingTestPurpose) {
 	defer h.Close()
-	h.Setup(setup.MydbData, MakeBigAdaptiveEncodingQueriesSetup(columnType))
-	enginetest.RunQueryTests(t, h, MakeBigAdaptiveEncodingQueries(columnType, testPurpose))
-	for _, tt := range MakeBigAdaptiveEncodingWriteQueries(columnType, testPurpose) {
-		enginetest.RunWriteQueryTest(t, h, tt)
+	t.Run(fmt.Sprintf("%v, %v", columnType, testPurpose), func(t *testing.T) {
+		h.Setup(setup.MydbData, MakeBigAdaptiveEncodingQueriesSetup(columnType))
+		enginetest.RunQueryTests(t, h, MakeBigAdaptiveEncodingQueries(columnType, testPurpose))
+		for _, tt := range MakeBigAdaptiveEncodingWriteQueries(columnType, testPurpose) {
+			enginetest.RunWriteQueryTest(t, h, tt)
+		}
+	})
+}
+
+func RunAdaptiveEncodingScripts(t *testing.T, h DoltEnginetestHarness) {
+	defer h.Close()
+	h.Setup(setup.MydbData)
+	for _, tt := range AdaptiveEncodingScripts {
+		enginetest.TestScript(t, h, tt)
 	}
 }
 
@@ -561,6 +571,17 @@ func RunLargeJsonObjectsTest(t *testing.T, harness DoltEnginetestHarness) {
 	}
 }
 
+func RunJsonAdaptiveEncodingTests(t *testing.T, harness DoltEnginetestHarness) {
+	defer harness.Close()
+	for _, script := range JsonAdaptiveEncodingScriptTests {
+		func() {
+			h := harness.NewHarness(t)
+			defer h.Close()
+			enginetest.TestScript(t, h, script)
+		}()
+	}
+}
+
 // RunTransactionTests runs transaction tests from GMS, as well as additional Dolt specific transaction tests. If
 // |prepared| is true, then the tests will be run using prepared statements, otherwise the queries will be directly
 // executed.
@@ -610,6 +631,17 @@ func RunTransactionTests(t *testing.T, h DoltEnginetestHarness, prepared bool) {
 		}()
 	}
 	for _, script := range DoltConstraintViolationTransactionTests {
+		func() {
+			h := h.NewHarness(t)
+			defer h.Close()
+			if prepared {
+				enginetest.TestTransactionScriptPrepared(t, h, script)
+			} else {
+				enginetest.TestTransactionScript(t, h, script)
+			}
+		}()
+	}
+	for _, script := range AutoIncrementTransactionTests {
 		func() {
 			h := h.NewHarness(t)
 			defer h.Close()
@@ -899,6 +931,12 @@ func RunDoltRevisionDbScriptsPreparedTest(t *testing.T, h DoltEnginetestHarness)
 func RunDoltDdlScripts(t *testing.T, harness DoltEnginetestHarness) {
 	defer harness.Close()
 	harness.Setup()
+
+	for _, script := range CreateTableScripts {
+		e, err := harness.NewEngine(t)
+		require.NoError(t, err)
+		enginetest.TestScriptWithEngine(t, e, harness, script)
+	}
 
 	for _, script := range ModifyAndChangeColumnScripts {
 		e, err := harness.NewEngine(t)
@@ -1984,6 +2022,16 @@ func RunAddDropPrimaryKeysTests(t *testing.T, harness DoltEnginetestHarness) {
 
 func RunDoltVerifyConstraintsTests(t *testing.T, harness DoltEnginetestHarness) {
 	for _, script := range DoltVerifyConstraintsTestScripts {
+		func() {
+			harness = harness.NewHarness(t)
+			defer harness.Close()
+			enginetest.TestScript(t, harness, script)
+		}()
+	}
+}
+
+func RunDoltForeignKeyTests(t *testing.T, harness DoltEnginetestHarness) {
+	for _, script := range DoltForeignKeyTests {
 		func() {
 			harness = harness.NewHarness(t)
 			defer harness.Close()

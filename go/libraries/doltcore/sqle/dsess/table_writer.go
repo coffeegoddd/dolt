@@ -30,7 +30,7 @@ import (
 // It's responsible for creating and managing the lifecycle of TableWriter's.
 type WriteSession interface {
 	// GetTableWriter creates a TableWriter and adds it to the WriteSession.
-	GetTableWriter(ctx *sql.Context, table doltdb.TableName, db string, setter SessionRootSetter, targetStaging bool) (TableWriter, error)
+	GetTableWriter(ctx *sql.Context, table doltdb.TableName) (TableWriter, error)
 
 	// GetWorkingSet returns the session's current working set.
 	GetWorkingSet() *doltdb.WorkingSet
@@ -62,11 +62,10 @@ type SessionRootSetter func(ctx *sql.Context, dbName string, root doltdb.RootVal
 
 // WriteSessionFlusher is responsible for flushing any pending edits to the session
 type WriteSessionFlusher interface {
-	// Flush flushes the pending writes in the session.
+	// Flush flushes the pending writes in the session
 	Flush(ctx *sql.Context) (*doltdb.WorkingSet, error)
-	// FlushWithAutoIncrementOverrides flushes the pending writes in the session, overriding the auto increment values
-	// for any tables provided in the map
-	FlushWithAutoIncrementOverrides(ctx *sql.Context, increment bool, autoIncrements map[string]uint64) (*doltdb.WorkingSet, error)
+	// FlushTable writes a materialized doltdb.Table to the RootValue
+	FlushTable(ctx *sql.Context, tblName doltdb.TableName, tbl *doltdb.Table) (doltdb.RootValue, error)
 }
 
 // WriterState caches expensive objects required for writing rows.
@@ -80,6 +79,9 @@ type WriterState struct {
 	PkValDesc  *val.TupleDesc
 	SecIndexes []IndexState
 	PriIndex   IndexState
+	// VirtualExpressions holds the table's resolved virtual column expressions, indexed by column
+	// position in the full schema.
+	VirtualExpressions []sql.Expression
 }
 
 // IndexState caches objects required for writing specific indexes.
@@ -95,4 +97,8 @@ type IndexState struct {
 	IsFullText    bool
 	IsUnique      bool
 	IsSpatial     bool
+	Predicate     sql.Expression
+	// KeyVirtualExprs is parallel to KeyMapping. A non-nil entry at position i is the resolved
+	// generating expression for a virtual generated column that is key part i of this index.
+	KeyVirtualExprs []sql.Expression
 }

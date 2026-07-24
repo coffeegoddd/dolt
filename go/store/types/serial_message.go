@@ -282,6 +282,9 @@ func (sm SerialMessage) HumanReadableStringAtIndentationLevel(level int) string 
 			printWithIndendationLevel(level, ret, "Generated: %t\n", col.Generated())
 			printWithIndendationLevel(level, ret, "Virtual: %t\n", col.Virtual())
 			printWithIndendationLevel(level, ret, "OnUpdateValue: %s\n", col.OnUpdateValue())
+			printWithIndendationLevel(level, ret, "UsesAdaptiveEncoding: %t\n", col.UsesAdaptiveEncoding())
+			printWithIndendationLevel(level, ret, "AdaptiveEncodingBreakingChange: %t\n", col.AdaptiveEncodingBreakingChange())
+
 			level -= 1
 			printWithIndendationLevel(level, ret, "}\n")
 
@@ -316,8 +319,8 @@ func (sm SerialMessage) HumanReadableStringAtIndentationLevel(level int) string 
 		printWithIndendationLevel(level, ret, "Checks: [\n")
 		level += 1
 		for i := 0; i < msg.ChecksLength(); i++ {
-			var check *serial.CheckConstraint
-			_, _ = msg.TryChecks(check, i)
+			var check serial.CheckConstraint
+			_, _ = msg.TryChecks(&check, i)
 			printWithIndendationLevel(level, ret, "{\n")
 			level += 1
 			printWithIndendationLevel(level, ret, "Name: %s\n", string(check.Name()))

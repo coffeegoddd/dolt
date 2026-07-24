@@ -24,6 +24,7 @@ import (
 
 	"github.com/dolthub/dolt/go/cmd/dolt/cli"
 	cmd "github.com/dolthub/dolt/go/cmd/dolt/commands"
+	"github.com/dolthub/dolt/go/libraries/doltcore/dbfactory"
 	"github.com/dolthub/dolt/go/libraries/doltcore/doltdb"
 	"github.com/dolthub/dolt/go/libraries/doltcore/doltdb/durable"
 	"github.com/dolthub/dolt/go/libraries/doltcore/dtestutils"
@@ -116,7 +117,7 @@ func (mr *MultiRepoTestSetup) NewDB(dbName string) {
 	}
 
 	// TODO sometimes tempfiles scrubber is racy with tempfolder deleter
-	dEnv := env.Load(context.Background(), mr.homeProv, filesys.LocalFS, doltdb.LocalDirDoltDB, "test")
+	dEnv := env.LoadWithoutDB(context.Background(), mr.homeProv, filesys.LocalFS, doltdb.LocalDirDoltDB, "test")
 	if err != nil {
 		mr.Errhand("Failed to initialize environment:" + err.Error())
 	}
@@ -125,12 +126,12 @@ func (mr *MultiRepoTestSetup) NewDB(dbName string) {
 		config.UserNameKey:  name,
 		config.UserEmailKey: email,
 	})
-	err = dEnv.InitRepo(context.Background(), types.Format_Default, name, email, defaultBranch)
+	err = dEnv.InitRepo(context.Background(), types.Format_DOLT, name, email, defaultBranch)
 	if err != nil {
 		mr.Errhand("Failed to initialize environment:" + err.Error())
 	}
 
-	ddb, err := doltdb.LoadDoltDB(ctx, types.Format_Default, doltdb.LocalDirDoltDB, filesys.LocalFS)
+	ddb, err := doltdb.LoadDoltDB(ctx, types.Format_DOLT, doltdb.LocalDirDoltDB, filesys.LocalFS)
 	if err != nil {
 		mr.Errhand("Failed to initialize environment:" + err.Error())
 	}
@@ -189,12 +190,12 @@ func (mr *MultiRepoTestSetup) CloneDB(fromRemote, dbName string) {
 	cloneDir := filepath.Join(mr.Root, dbName)
 
 	r := mr.GetRemote(fromRemote)
-	srcDB, err := r.GetRemoteDB(ctx, types.Format_Default, mr.envs[dbName])
+	srcDB, err := r.GetRemoteDB(ctx, types.Format_DOLT, mr.envs[dbName])
 	if err != nil {
 		mr.Errhand(err)
 	}
 
-	dEnv := env.Load(context.Background(), mr.homeProv, filesys.LocalFS, doltdb.LocalDirDoltDB, "test")
+	dEnv := env.LoadWithoutDB(context.Background(), mr.homeProv, filesys.LocalFS, doltdb.LocalDirDoltDB, "test")
 	dEnv, err = actions.EnvForClone(ctx, srcDB.Format(), r, cloneDir, dEnv.FS, dEnv.Version, mr.homeProv)
 	if err != nil {
 		mr.Errhand(err)
@@ -203,6 +204,11 @@ func (mr *MultiRepoTestSetup) CloneDB(fromRemote, dbName string) {
 	pull.WithDiscardingStatsCh(func(statsCh chan pull.Stats) {
 		err = actions.CloneRemote(ctx, srcDB, r.Name, "", false, -1, dEnv, statsCh)
 	})
+	if err != nil {
+		mr.Errhand(err)
+	}
+
+	err = dbfactory.ClearDatabaseInProgress(dEnv.FS)
 	if err != nil {
 		mr.Errhand(err)
 	}
@@ -259,19 +265,18 @@ func (mr *MultiRepoTestSetup) CommitWithWorkingSet(dbName string) *doltdb.Commit
 		mergeParentCommits = []*doltdb.Commit{ws.MergeState().Commit()}
 	}
 
-	t := datas.CommitterDate()
 	roots, err := dEnv.Roots(ctx)
 	if err != nil {
 		panic("couldn't get roots: " + err.Error())
 	}
-	pendingCommit, err := actions.GetCommitStaged(ctx, doltdb.SimpleTableResolver{}, roots, ws, mergeParentCommits, dEnv.DbData(ctx).Ddb, actions.CommitStagedProps{
+	ident := datas.CommitIdent{Name: name, Email: email}
+	commitStagedProps := actions.CommitStagedProps{
 		Message:    "auto commit",
-		Date:       t,
 		AllowEmpty: true,
-		Force:      false,
-		Name:       name,
-		Email:      email,
-	})
+		Author:     ident,
+		Committer:  ident,
+	}
+	pendingCommit, err := actions.GetCommitStaged(ctx, doltdb.SimpleTableResolver{}, roots, ws, mergeParentCommits, dEnv.DbData(ctx).Ddb, commitStagedProps)
 	if err != nil {
 		panic("pending commit error: " + err.Error())
 	}

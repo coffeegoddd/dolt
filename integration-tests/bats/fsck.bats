@@ -62,8 +62,7 @@ UPDATE tbl SET guid = UUID() WHERE i >= @random_id LIMIT 1;"
   done
   dolt sql -q "$stmt"
 
-  dolt gc
-  dolt archive
+  dolt gc --archive-level 1
 
   dolt fsck
 }
@@ -108,7 +107,7 @@ UPDATE tbl SET guid = UUID() WHERE i >= @random_id LIMIT 1;"
   printf '\x00\x00\x00\x00' >> "$journal"
   cat $BATS_CWD/corrupt_dbs/journal_data.bin >> "$journal"
 
-  run dolt status
+  run dolt log
   [ "$status" -eq 1 ]
   [[ "$output" =~ "please run 'dolt fsck' to assess the damage and attempt repairs" ]] || false
 
@@ -178,4 +177,51 @@ UPDATE tbl SET guid = UUID() WHERE i >= @random_id LIMIT 1;"
   run dolt fsck
   [ "$status" -eq 1 ]
   [[ "$output" =~ "::commit:0vh56jekvb9hs0kqf8e8dc5208s0o0mi: read failure of fthj68monkbgkrb6g4c11php7ht2dib" ]] || false
+}
+
+@test "fsck: opens database correctly on Windows paths including spaces" {
+  # Normal path
+  dolt init
+  dolt sql -q "create table t (i int primary key)"
+  dolt commit -Am "create t"
+
+  run dolt fsck
+  [ "$status" -eq 0 ]
+  ! [[ "$output" =~ "the filename, directory name, or volume label syntax is incorrect" ]] || false
+
+  # Path with spaces
+  local spacedir
+  spacedir="$(mktemp -d "$BATS_TMPDIR/fsck spaces XXXXXX")"
+  cd "$spacedir"
+
+  dolt init
+  dolt sql -q "create table t (i int primary key)"
+  dolt commit -Am "create t"
+
+  run dolt fsck
+  [ "$status" -eq 0 ]
+  ! [[ "$output" =~ "the filename, directory name, or volume label syntax is incorrect" ]] || false
+}
+
+@test "fsck: passes with a stash present" {
+  dolt init
+  dolt sql -q "create table t (id int primary key, value int); insert into t values (1, 1);"
+  dolt add t
+  dolt commit -m "initialize repro table"
+
+  dolt sql -q "update t set value=2 where id=1;"
+  dolt stash
+
+  run dolt stash list
+  [ "$status" -eq 0 ]
+  [[ "$output" =~ "stash@{0}" ]] || false
+
+  run dolt fsck
+  [ "$status" -eq 0 ]
+  [[ "$output" =~ "No problems found." ]] || false
+  ! [[ "$output" =~ "has incorrect file ID" ]] || false
+
+  run dolt stash list
+  [ "$status" -eq 0 ]
+  [[ "$output" =~ "stash@{0}" ]] || false
 }

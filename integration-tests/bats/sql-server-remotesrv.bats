@@ -14,17 +14,27 @@ setup() {
 }
 
 teardown() {
-    stop_sql_server
-    teardown_common
+    stop_sql_server 1
     if [ -n "$srv_pid" ]; then
         kill $srv_pid
+        wait $srv_pid || :
+        srv_pid=
     fi
     if [ -n "$srv_two_pid" ]; then
         kill $srv_two_pid
+        wait $srv_two_pid || :
+        srv_two_pid=
     fi
+    teardown_common
 }
 
-@test "sql-server-remotesrv: can read from sql-server with --remotesapi-port" {
+_do_read_from_sql_server_remotesapi_port_scenario() {
+    local disabled_features="$1"
+    if [ -n "$disabled_features" ]; then
+        export DOLT_REMOTESAPI_DISABLED_FEATURES="$disabled_features"
+    else
+        unset DOLT_REMOTESAPI_DISABLED_FEATURES
+    fi
     mkdir -p db/remote
     cd db/remote
     dolt init
@@ -56,9 +66,23 @@ call dolt_commit('-am', 'add some vals');
     [[ "$output" =~ "10" ]] || false
 }
 
+@test "sql-server-remotesrv: can read from sql-server with --remotesapi-port, new RPC" {
+    _do_read_from_sql_server_remotesapi_port_scenario ""
+}
+
+@test "sql-server-remotesrv: can read from sql-server with --remotesapi-port, legacy RPC" {
+    _do_read_from_sql_server_remotesapi_port_scenario "FEATURE_STREAM_CHUNK_LOCATIONS"
+}
+
 # Asserts we can use dolt_checkout() to check out a new branch that was pushed to a running
 # sql-server, and that the branch has a valid, writeable working set.
-@test "sql-server-remotesrv: can checkout a new branch pushed to a sql-server remote" {
+_do_checkout_new_branch_pushed_to_sql_server_scenario() {
+    local disabled_features="$1"
+    if [ -n "$disabled_features" ]; then
+        export DOLT_REMOTESAPI_DISABLED_FEATURES="$disabled_features"
+    else
+        unset DOLT_REMOTESAPI_DISABLED_FEATURES
+    fi
     mkdir -p db/remote
     cd db/remote
     dolt init
@@ -81,6 +105,14 @@ CREATE TABLE t123 (pk int primary key);
 SELECT 'abcdefg';"
     [ "$status" -eq 0 ]
     [[ "$output" =~ "abcdefg" ]] || false
+}
+
+@test "sql-server-remotesrv: can checkout a new branch pushed to a sql-server remote, new RPC" {
+    _do_checkout_new_branch_pushed_to_sql_server_scenario ""
+}
+
+@test "sql-server-remotesrv: can checkout a new branch pushed to a sql-server remote, legacy RPC" {
+    _do_checkout_new_branch_pushed_to_sql_server_scenario "FEATURE_STREAM_CHUNK_LOCATIONS"
 }
 
 @test "sql-server-remotesrv: pushing a new branch creates a working set" {
@@ -187,9 +219,10 @@ call dolt_commit('-m', 'add some vals');
 set @@persist.dolt_read_replica_remote = 'origin';
 set @@persist.dolt_replicate_all_heads = 1;
 SQL
-    cat .dolt/config.json
+    cat .dolt/config.json && echo
     dolt sql-server --port 3307 &
     srv_two_pid=$!
+    wait_for_connection 3307 8500
 
     # move CWD to make sure we don't lock ".../read_replica/db"
     cd ../../

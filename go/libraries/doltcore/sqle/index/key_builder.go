@@ -15,6 +15,9 @@
 package index
 
 import (
+	"context"
+	"fmt"
+
 	"github.com/dolthub/go-mysql-server/sql"
 
 	"github.com/dolthub/dolt/go/libraries/doltcore/schema"
@@ -63,11 +66,19 @@ func NewSecondaryKeyBuilder(ctx *sql.Context, tableName string, sch schema.Schem
 
 				virtualExpressions[i] = expr
 				j = -1
-			} else if keyless {
-				// Skip cardinality column
-				j = b.split + 1 + sch.GetNonPKCols().TagToIdx[tag]
 			} else {
-				j = b.split + sch.GetNonPKCols().TagToIdx[tag]
+				// Use StoredIndexByTag (not TagToIdx) so that virtual columns
+				// don't offset the tuple index
+				storedIdx, ok := sch.GetNonPKCols().StoredIndexByTag(tag)
+				if !ok {
+					return SecondaryKeyBuilder{}, fmt.Errorf("tag %d not found in stored non-PK columns", tag)
+				}
+				// keyless tables have an extra cardinality column before the value fields
+				if keyless {
+					j = b.split + 1 + storedIdx
+				} else {
+					j = b.split + storedIdx
+				}
 			}
 		}
 		b.mapping[i] = j
@@ -160,7 +171,7 @@ func (b SecondaryKeyBuilder) SecondaryKeyFromRow(ctx *sql.Context, k, v val.Tupl
 			}
 		}
 	}
-	return b.builder.Build(b.pool)
+	return b.builder.Build(ctx, b.pool)
 }
 
 // BuildRow returns a sql.Row for the given key/value tuple pair
@@ -216,9 +227,9 @@ type ClusteredKeyBuilder struct {
 }
 
 // ClusteredKeyFromIndexKey builds a clustered index key from a secondary index key.
-func (b ClusteredKeyBuilder) ClusteredKeyFromIndexKey(k val.Tuple) (val.Tuple, error) {
+func (b ClusteredKeyBuilder) ClusteredKeyFromIndexKey(ctx context.Context, k val.Tuple) (val.Tuple, error) {
 	for to, from := range b.mapping {
 		b.builder.PutRaw(to, k.GetField(from))
 	}
-	return b.builder.Build(b.pool)
+	return b.builder.Build(ctx, b.pool)
 }

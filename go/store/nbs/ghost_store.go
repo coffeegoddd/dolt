@@ -135,6 +135,13 @@ func (g GhostBlockStore) Has(ctx context.Context, h hash.Hash) (bool, error) {
 	return false, nil
 }
 
+// HasGhosts reports whether any ghost chunks are recorded, which is the case
+// for a shallow clone whose unfetched history is represented by ghost chunks. A
+// generational store may hold a nil ghost store, which reports no ghosts.
+func (g *GhostBlockStore) HasGhosts() bool {
+	return g != nil && g.skippedRefs != nil && g.skippedRefs.Size() > 0
+}
+
 func (g GhostBlockStore) HasMany(ctx context.Context, hashes hash.HashSet) (absent hash.HashSet, err error) {
 	return g.hasMany(hashes)
 }
@@ -163,7 +170,7 @@ func (g GhostBlockStore) refCheck(recs []hasRecord) (hash.HashSet, error) {
 	return absent, nil
 }
 
-func (g GhostBlockStore) Put(ctx context.Context, c chunks.Chunk, getAddrs chunks.GetAddrsCurry) error {
+func (g GhostBlockStore) Put(ctx context.Context, c chunks.Chunk, getAddrs chunks.InsertAddrsCurry) error {
 	panic("GhostBlockStore does not support Put")
 }
 
@@ -198,4 +205,8 @@ func (g GhostBlockStore) StatsSummary() string {
 
 func (g GhostBlockStore) Close() error {
 	panic("GhostBlockStore does not support Close")
+}
+
+func (g GhostBlockStore) Teardown(ctx context.Context) error {
+	return nil
 }
